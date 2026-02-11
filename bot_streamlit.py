@@ -1,11 +1,10 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 st.set_page_config(page_title="Bot Trading (Démo)", layout="wide")
-st.title("🤖 Bot Trading — Démo publique (V2)")
-st.caption("Backtest + signaux. Aucun ordre réel n’est envoyé. (Données: Stooq)")
+st.title("🤖 Bot Trading — Démo publique (V3 Agressif)")
+st.caption("Backtest + signaux. Aucun ordre réel. Données: Stooq. (Attention: levier = risque accru)")
 
 # -----------------------------
 # Data
@@ -20,12 +19,14 @@ def download_prices(ticker: str) -> pd.DataFrame:
 
 def clip_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     d = df.copy()
-    d = d[(d.index >= pd.to_datetime(start)) & (d.index <= pd.to_datetime(end))]
-    return d
+    return d[(d.index >= pd.to_datetime(start)) & (d.index <= pd.to_datetime(end))]
 
 # -----------------------------
 # Indicators
 # -----------------------------
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -35,37 +36,99 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
-
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
 # -----------------------------
-# Backtest engine (simple)
+# Agressive strategy: MA + RSI confirm
 # -----------------------------
-def run_backtest(df: pd.DataFrame, position: pd.Series, fee_bps: float) -> pd.DataFrame:
+def aggressive_signal(df: pd.DataFrame, ma_fast: int, ma_slow: int, rsi_period: int, rsi_min: float) -> pd.Series:
     """
-    position: 0 ou 1 (long only).
-    fee_bps: frais en basis points (ex: 10 bps = 0.10%)
+    Long si:
+      - MA_fast > MA_slow (tendance)
+      - RSI > rsi_min (momentum)
+    """
+    d = df.copy()
+    d["ma_fast"] = d["Close"].rolling(ma_fast).mean()
+    d["ma_slow"] = d["Close"].rolling(ma_slow).mean()
+    d["rsi"] = rsi(d["Close"], rsi_period)
+    sig = ((d["ma_fast"] > d["ma_slow"]) & (d["rsi"] > rsi_min)).astype(int)
+    return sig
+
+# -----------------------------
+# Backtest engine (with leverage + optional stops)
+# -----------------------------
+def run_backtest(
+    df: pd.DataFrame,
+    signal: pd.Series,
+    fee_bps: float,
+    leverage: float,
+    use_regime_filter: bool,
+    regime_ma: int,
+    stop_loss_pct: float,
+    take_profit_pct: float,
+) -> pd.DataFrame:
+    """
+    - long-only
+    - leverage applied to daily returns when in position (simple model)
+    - optional regime filter: only long if Close > MA(regime_ma)
+    - optional stop loss / take profit based on entry price (state machine)
     """
     d = df.copy()
     d["ret"] = d["Close"].pct_change().fillna(0)
 
-    # trades quand la position change (0->1 ou 1->0)
-    pos = position.fillna(0).astype(float)
-    d["position"] = pos.shift(1).fillna(0)  # exécuté le lendemain
-    d["trade"] = d["position"].diff().abs().fillna(0)
+    # Regime filter
+    if use_regime_filter:
+        d["regime_ma"] = d["Close"].rolling(regime_ma).mean()
+        regime_ok = (d["Close"] > d["regime_ma"]).astype(int)
+    else:
+        regime_ok = pd.Series(1, index=d.index)
 
-    fee = (fee_bps / 10000.0)  # bps -> fraction
-    d["fee"] = d["trade"] * fee  # payé à chaque changement
+    raw_sig = (signal.fillna(0).astype(int) * regime_ok.fillna(0).astype(int)).astype(int)
+
+    # State machine for stops
+    pos = pd.Series(0.0, index=d.index)
+    entry_price = None
+    in_pos = 0
+
+    for i in range(len(d)):
+        price = float(d["Close"].iloc[i])
+        want_long = int(raw_sig.iloc[i])
+
+        if in_pos == 0:
+            if want_long == 1:
+                in_pos = 1
+                entry_price = price
+        else:
+            # in position -> check stops if enabled
+            if entry_price is not None:
+                pnl = (price / entry_price) - 1.0
+
+                if stop_loss_pct > 0 and pnl <= -abs(stop_loss_pct):
+                    in_pos = 0
+                    entry_price = None
+                elif take_profit_pct > 0 and pnl >= abs(take_profit_pct):
+                    in_pos = 0
+                    entry_price = None
+                else:
+                    # also exit if signal turns off
+                    if want_long == 0:
+                        in_pos = 0
+                        entry_price = None
+
+        pos.iloc[i] = float(in_pos) * float(leverage)
+
+    # Execute next day
+    d["position"] = pos.shift(1).fillna(0)
+
+    # trades for fees: fee on changes in absolute exposure
+    d["trade"] = d["position"].diff().abs().fillna(0)
+    fee = (fee_bps / 10000.0)
+    d["fee"] = d["trade"] * fee
+
+    # leveraged return (simple) minus fees
     d["strategy_ret"] = d["position"] * d["ret"] - d["fee"]
 
     d["equity"] = (1 + d["strategy_ret"]).cumprod()
     d["buy_hold"] = (1 + d["ret"]).cumprod()
+    d["signal"] = raw_sig
     return d
 
 def stats(d: pd.DataFrame) -> dict:
@@ -74,7 +137,6 @@ def stats(d: pd.DataFrame) -> dict:
         return {}
 
     total_return = eq.iloc[-1] - 1
-    # approx annualization
     days = (eq.index[-1] - eq.index[0]).days
     years = max(days / 365.25, 1e-9)
     cagr = (eq.iloc[-1] ** (1 / years)) - 1
@@ -85,7 +147,7 @@ def stats(d: pd.DataFrame) -> dict:
     daily = d["strategy_ret"].dropna()
     sharpe = 0.0 if daily.std() == 0 else (daily.mean() / daily.std()) * np.sqrt(252)
 
-    trades = int(d["trade"].sum())  # approx (entrée + sortie comptent)
+    trades = int(d["trade"].sum())
     return {
         "Rendement total": total_return,
         "CAGR (approx.)": cagr,
@@ -95,93 +157,59 @@ def stats(d: pd.DataFrame) -> dict:
     }
 
 # -----------------------------
-# Strategies
-# -----------------------------
-def strat_ma(df: pd.DataFrame, fast: int, slow: int) -> pd.Series:
-    ma_fast = df["Close"].rolling(fast).mean()
-    ma_slow = df["Close"].rolling(slow).mean()
-    signal = (ma_fast > ma_slow).astype(int)
-    return signal
-
-def strat_rsi(df: pd.DataFrame, period: int, low: float, high: float) -> pd.Series:
-    r = rsi(df["Close"], period)
-    # simple: long si RSI < low (survente) jusqu'à ce que RSI > high
-    pos = pd.Series(0, index=df.index, dtype=int)
-    in_pos = 0
-    for i in range(len(df)):
-        if np.isnan(r.iloc[i]):
-            pos.iloc[i] = in_pos
-            continue
-        if in_pos == 0 and r.iloc[i] < low:
-            in_pos = 1
-        elif in_pos == 1 and r.iloc[i] > high:
-            in_pos = 0
-        pos.iloc[i] = in_pos
-    return pos
-
-def strat_macd(df: pd.DataFrame, fast: int, slow: int, sig: int) -> pd.Series:
-    macd_line, signal_line, _ = macd(df["Close"], fast, slow, sig)
-    signal = (macd_line > signal_line).astype(int)
-    return signal
-
-# -----------------------------
 # UI
 # -----------------------------
 st.sidebar.header("Paramètres")
-ticker = st.sidebar.text_input("Ticker (Stooq)", value="aapl.us", help="Ex: aapl.us, msft.us, shop.us, ry.ca, td.ca")
+ticker = st.sidebar.text_input("Ticker (Stooq)", value="aapl.us", help="Ex: aapl.us, msft.us, nvda.us, tsla.us, ry.ca")
 start = st.sidebar.date_input("Début", value=pd.to_datetime("2020-01-01"))
 end = st.sidebar.date_input("Fin", value=pd.to_datetime("2025-12-31"))
 
-strategy = st.sidebar.selectbox("Stratégie", ["Moyennes mobiles (MA)", "RSI (mean-reversion)", "MACD (trend)"])
-fee_bps = st.sidebar.slider("Frais (bps)", 0, 50, 10, help="10 bps = 0.10% par trade (entrée/sortie)")
+st.sidebar.subheader("Stratégie Agressive (MA + RSI)")
+ma_fast = st.sidebar.slider("MA rapide", 5, 60, 15)
+ma_slow = st.sidebar.slider("MA lente", 20, 250, 80)
+rsi_period = st.sidebar.slider("RSI période", 5, 30, 14)
+rsi_min = st.sidebar.slider("RSI minimum (confirmation)", 40, 70, 55)
 
-# params par stratégie
-if strategy.startswith("Moyennes"):
-    fast = st.sidebar.slider("MA rapide", 5, 60, 20)
-    slow = st.sidebar.slider("MA lente", 20, 200, 50)
-elif strategy.startswith("RSI"):
-    rsi_period = st.sidebar.slider("RSI période", 5, 30, 14)
-    low = st.sidebar.slider("Seuil bas (entrée)", 5, 45, 30)
-    high = st.sidebar.slider("Seuil haut (sortie)", 55, 95, 70)
-else:
-    macd_fast = st.sidebar.slider("MACD fast", 5, 20, 12)
-    macd_slow = st.sidebar.slider("MACD slow", 15, 60, 26)
-    macd_sig = st.sidebar.slider("MACD signal", 5, 20, 9)
+st.sidebar.subheader("Risque / Exécution")
+fee_bps = st.sidebar.slider("Frais (bps)", 0, 50, 10)
+leverage = st.sidebar.slider("Levier", 1.0, 2.0, 1.5, 0.1)
+
+use_regime_filter = st.sidebar.checkbox("Filtre régime (protection crash)", value=False)
+regime_ma = st.sidebar.slider("MA régime", 100, 300, 200) if use_regime_filter else 200
+
+st.sidebar.subheader("Stops (optionnels)")
+stop_loss_pct = st.sidebar.slider("Stop-loss (%)", 0.0, 30.0, 0.0, 0.5) / 100.0
+take_profit_pct = st.sidebar.slider("Take-profit (%)", 0.0, 80.0, 0.0, 1.0) / 100.0
 
 run = st.sidebar.button("Lancer le backtest")
 
 if not run:
-    st.info("Choisis un ticker et clique sur **Lancer le backtest**. Ex: `aapl.us`, `msft.us`, `ry.ca`")
+    st.info("Choisis un ticker et clique sur **Lancer le backtest**.")
     st.stop()
 
-# -----------------------------
-# Execution
-# -----------------------------
 try:
+    if ma_fast >= ma_slow:
+        st.error("MA rapide doit être < MA lente.")
+        st.stop()
+
     prices = download_prices(ticker)
     prices = clip_dates(prices, str(start), str(end))
 
     if prices.empty or "Close" not in prices.columns:
-        st.error("Données indisponibles. Essaie un autre ticker (ex: aapl.us, msft.us, ry.ca).")
+        st.error("Données indisponibles. Essaie un autre ticker (ex: aapl.us, nvda.us, tsla.us).")
         st.stop()
 
-    if strategy.startswith("Moyennes"):
-        if fast >= slow:
-            st.error("MA rapide doit être plus petite que MA lente.")
-            st.stop()
-        pos = strat_ma(prices, fast, slow)
-    elif strategy.startswith("RSI"):
-        if low >= high:
-            st.error("Le seuil bas doit être plus petit que le seuil haut.")
-            st.stop()
-        pos = strat_rsi(prices, rsi_period, low, high)
-    else:
-        if macd_fast >= macd_slow:
-            st.error("MACD fast doit être < MACD slow.")
-            st.stop()
-        pos = strat_macd(prices, macd_fast, macd_slow, macd_sig)
+    sig = aggressive_signal(prices, ma_fast, ma_slow, rsi_period, rsi_min)
+    d = run_backtest(
+        prices, sig,
+        fee_bps=fee_bps,
+        leverage=leverage,
+        use_regime_filter=use_regime_filter,
+        regime_ma=regime_ma,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+    )
 
-    d = run_backtest(prices, pos, fee_bps)
     s = stats(d)
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -194,14 +222,14 @@ try:
     st.subheader("Équité (Stratégie vs Buy & Hold)")
     st.line_chart(pd.DataFrame({"Stratégie": d["equity"], "Buy & Hold": d["buy_hold"]}))
 
-    st.subheader("Dernier signal")
+    st.subheader("Dernier état")
     last = d.dropna().iloc[-1]
-    signal_txt = "📈 LONG (position ON)" if last["position"] == 1 else "📉 CASH (position OFF)"
-    st.info(f"Au {last.name.date()} : {signal_txt}")
+    state = "📈 LONG" if last["position"] > 0 else "📉 CASH"
+    st.info(f"Au {last.name.date()} : {state} | Exposition: {last['position']:.1f}x | Signal brut: {int(last['signal'])}")
 
-    st.subheader("Aperçu des signaux & indicateurs")
-    show = d[["Close", "position", "strategy_ret", "equity"]].tail(250).copy()
-    st.dataframe(show, use_container_width=True)
+    st.subheader("Aperçu (dernier 250 jours)")
+    view = d[["Close", "signal", "position", "strategy_ret", "equity", "buy_hold"]].tail(250).copy()
+    st.dataframe(view, use_container_width=True)
 
 except Exception as e:
     st.exception(e)
