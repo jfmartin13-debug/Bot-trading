@@ -346,7 +346,7 @@ else:
     top_k = st.sidebar.slider("Nombre d'actifs sélectionnés", 1, 3, 2)
 
     market_filter_on = st.sidebar.checkbox("Filtre marché (SPY au-dessus MA)", value=True)
-    market_ma = st.sidebar.slider("MA marché (mois)", 6, 24, 10)
+    market_ma = st.sidebar.slider("MA marché (mois)", 6, 24, 12)
 
     try:
         # download
@@ -399,4 +399,5 @@ else:
 
     except Exception as e:
         st.exception(e)
+
 
