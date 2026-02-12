@@ -1,7 +1,19 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-
+@st.cache_data(ttl=60 * 60)
+def safe_download_prices(ticker: str) -> pd.DataFrame:
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
+    try:
+        df = pd.read_csv(url)
+        if "Date" not in df.columns or "Close" not in df.columns:
+            return pd.DataFrame()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
+        return df
+    except Exception:
+        return pd.DataFrame()
+    
 st.set_page_config(page_title="Bot Trading (Démo)", layout="wide")
 st.title("🤖 Bot Trading — Démo publique (V4)")
 st.caption("Backtests + signaux. Aucun ordre réel. Données: Stooq.")
@@ -387,3 +399,4 @@ else:
 
     except Exception as e:
         st.exception(e)
+
