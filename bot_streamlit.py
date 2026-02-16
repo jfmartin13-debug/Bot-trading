@@ -319,19 +319,19 @@ if mode.startswith("Single-asset"):
         
 st.subheader("📝 Message automatique (prêt à publier)")
 
-# Dernier mois dispo
-last_date = out_m.dropna().index[-1]
-last_row = out_m.loc[last_date]
+        valid = out_m.dropna()
+        if valid.empty:
+            st.warning("Pas assez de données pour générer un message.")
+        else:
+            last_date = valid.index[-1]
+            last_row = out_m.loc[last_date]
+            last_weights = w.loc[last_date]
 
-# Derniers poids (allocation)
-last_weights = w.loc[last_date]
-alloc = last_weights[last_weights > 0].sort_values(ascending=False)
+            alloc = last_weights[last_weights > 0].sort_values(ascending=False)
+            alloc_text = ", ".join([f"{sym.upper()} {int(weight*100)}%" for sym, weight in alloc.items()])
+            regime_text = "RISK-ON ✅" if int(last_row["risk_on"]) == 1 else "RISK-OFF 🛡️"
 
-alloc_text = ", ".join([f"{sym.upper()} {int(weight*100)}%" for sym, weight in alloc.items()])
-regime_text = "RISK-ON ✅" if int(last_row["risk_on"]) == 1 else "RISK-OFF 🛡️"
-
-msg = f"""📊 Rapport stratégie (Rotation Multi-Asset)
-Période backtest: {start} → {end}
+            msg = f"""📊 Rapport stratégie (Rotation Multi-Asset)
 
 Performance:
 • CAGR: {s['CAGR (approx.)']*100:.2f}%
@@ -341,22 +341,10 @@ Performance:
 État actuel ({last_date.date()}):
 • Régime marché: {regime_text}
 • Allocation: {alloc_text}
-• Frais (bps): {fee_bps}
-
-Note: Ceci est une simulation historique (backtest). Aucun conseil financier.
 """
 
-st.text_area("Message", msg, height=220)
-st.download_button("Télécharger le message (.txt)", msg, file_name="rapport_rotation.txt")
-        st.subheader("Équité (Stratégie vs Buy & Hold)")
-        st.line_chart(pd.DataFrame({"Stratégie": d["equity"], "Buy & Hold": d["buy_hold"]}))
-
-        st.subheader("Dernier signal")
-        last = d.dropna().iloc[-1]
-        st.info(f"Au {last.name.date()} : {'📈 LONG' if last['position'] == 1 else '📉 CASH'}")
-
-        st.subheader("Données (dernier 250 jours)")
-        st.dataframe(d[["Close", "position", "strategy_ret", "equity", "buy_hold"]].tail(250), use_container_width=True)
+            st.text_area("Message", msg, height=220)
+            st.download_button("Télécharger le message (.txt)", msg, file_name="rapport_rotation.txt")
 
     except Exception as e:
         st.exception(e)
@@ -430,6 +418,7 @@ else:
 
     except Exception as e:
         st.exception(e)
+
 
 
 
