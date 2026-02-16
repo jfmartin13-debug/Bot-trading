@@ -316,6 +316,7 @@ if mode.startswith("Single-asset"):
         c3.metric("Sharpe", f"{s['Sharpe (approx.)']:.2f}")
         c4.metric("Max DD", f"{s['Max drawdown']*100:.2f}%")
         c5.metric("Trades", f"{s['Trades (approx.)']}")
+        
 st.subheader("📝 Message automatique (prêt à publier)")
 
 # Dernier mois dispo
@@ -429,6 +430,7 @@ else:
 
     except Exception as e:
         st.exception(e)
+
 
 
 
