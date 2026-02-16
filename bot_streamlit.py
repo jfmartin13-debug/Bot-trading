@@ -316,7 +316,37 @@ if mode.startswith("Single-asset"):
         c3.metric("Sharpe", f"{s['Sharpe (approx.)']:.2f}")
         c4.metric("Max DD", f"{s['Max drawdown']*100:.2f}%")
         c5.metric("Trades", f"{s['Trades (approx.)']}")
+st.subheader("📝 Message automatique (prêt à publier)")
 
+# Dernier mois dispo
+last_date = out_m.dropna().index[-1]
+last_row = out_m.loc[last_date]
+
+# Derniers poids (allocation)
+last_weights = w.loc[last_date]
+alloc = last_weights[last_weights > 0].sort_values(ascending=False)
+
+alloc_text = ", ".join([f"{sym.upper()} {int(weight*100)}%" for sym, weight in alloc.items()])
+regime_text = "RISK-ON ✅" if int(last_row["risk_on"]) == 1 else "RISK-OFF 🛡️"
+
+msg = f"""📊 Rapport stratégie (Rotation Multi-Asset)
+Période backtest: {start} → {end}
+
+Performance:
+• CAGR: {s['CAGR (approx.)']*100:.2f}%
+• Sharpe: {s['Sharpe (approx.)']:.2f}
+• Max Drawdown: {s['Max drawdown']*100:.2f}%
+
+État actuel ({last_date.date()}):
+• Régime marché: {regime_text}
+• Allocation: {alloc_text}
+• Frais (bps): {fee_bps}
+
+Note: Ceci est une simulation historique (backtest). Aucun conseil financier.
+"""
+
+st.text_area("Message", msg, height=220)
+st.download_button("Télécharger le message (.txt)", msg, file_name="rapport_rotation.txt")
         st.subheader("Équité (Stratégie vs Buy & Hold)")
         st.line_chart(pd.DataFrame({"Stratégie": d["equity"], "Buy & Hold": d["buy_hold"]}))
 
@@ -399,5 +429,6 @@ else:
 
     except Exception as e:
         st.exception(e)
+
 
 
