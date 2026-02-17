@@ -155,6 +155,7 @@ def rotation_monthly_backtest(
 mom_3 = mdf.pct_change(3)
 mom_6 = mdf.pct_change(6)
 mom = (mom_3 + mom_6) / 2
+
     if market_filter_on:
         if market_symbol not in mdf.columns:
             raise ValueError(f"Market symbol {market_symbol} absent des données.")
@@ -425,4 +426,5 @@ Note: Ceci est un backtest (simulation), pas un conseil financier.
 
     except Exception as e:
         st.exception(e)
+
 
