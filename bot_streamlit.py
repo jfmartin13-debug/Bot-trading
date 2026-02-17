@@ -1,43 +1,29 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
-# Streamlit Trading Bot (Single-asset + Multi-asset)
-# Version ULTRA SIMPLE & STABLE: données via upload CSV (aucun provider externe)
-#
-# Multi-asset :
-#   Univers : SPY, QQQ, EFA, EEM, VNQ, TLT, IEF, GLD (ou ce que tu uploades)
-#   Filtre marché ON (MA 12 mois sur SPY)
-#   Top 2
-#   Frais 10 bps sur turnover
-#   Message automatique intégré
-#
-# Format CSV recommandé (wide):
-#   Date,SPY,QQQ,EFA,...
-#   2006-01-03,123.45,....,...
-#   ...
-# (prix "Close" ou "Adj Close", peu importe, tant que c'est cohérent)
+# Trading Bot Streamlit — Version SIMPLE & STABLE (CSV Upload)
+# - Pas de yfinance / pas de Stooq : tu uploades un CSV de prix
+# - Multi-asset : filtre marché (MA 12), Top N, frais (bps), momentum (single/dual)
+# - Single-asset : buy&hold comparatif
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import math
-import textwrap
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-try:
-    import plotly.express as px
-except Exception:
-    px = None
 
-
-st.set_page_config(page_title="Trading Bot — CSV Upload", page_icon="📈", layout="wide")
-st.title("📈 Trading Bot — Single + Multi-asset (Dual Momentum) — CSV Upload")
-st.caption("Aucune source externe (Stooq/yfinance) : tu uploades tes prix en CSV et le backtest tourne.")
+# -----------------------------
+# UI config
+# -----------------------------
+st.set_page_config(page_title="Trading Bot (CSV)", page_icon="📈", layout="wide")
+st.title("📈 Trading Bot — Single + Multi-asset (Dual Momentum) — CSV")
+st.caption("Version ultra stable : pas de data provider externe. Upload un CSV de prix (Date + colonnes tickers).")
 
 
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "EFA", "EEM", "VNQ", "TLT", "IEF", "GLD"]
@@ -45,22 +31,41 @@ DEFAULT_SINGLE = "SPY"
 
 
 @dataclass(frozen=True)
-class BacktestConfig:
-    start: str
-    end: str
-    rebalance: str                 # "M" ou "W"
-    fee_bps: float                 # ex 10 = 0.10%
+class Config:
+    rebalance: str                  # "M" ou "W"
+    fee_bps: float                  # ex: 10 = 0.10%
     top_n: int
     market_filter_on: bool
     market_filter_asset: str
-    market_filter_ma_periods: int  # 12 périodes (mensuel) ou 52 (hebdo) selon rebalance
-    risk_off_mode: str             # "CASH" ou "DEFENSIVE"
+    market_filter_window: int       # 12 périodes (mensuel) ou 52 (hebdo)
+    risk_off_mode: str              # "CASH" ou "DEFENSIVE"
     defensive_asset: str
-    momentum_mode: str             # "SINGLE" ou "DUAL"
+    momentum_mode: str              # "SINGLE" ou "DUAL"
     mom_single_lb: int
     mom_dual_lb: Tuple[int, int]
     mom_dual_w: Tuple[float, float]
     long_only: bool
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def load_wide_csv(uploaded_file) -> pd.DataFrame:
+    """
+    CSV attendu:
+      Date,SPY,QQQ,EFA,...
+      2006-01-03,123.4,45.6,...
+    """
+    df = pd.read_csv(uploaded_file)
+    if df.shape[1] < 2:
+        raise ValueError("CSV invalide: il faut une colonne Date + au moins 1 colonne ticker.")
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(how="all")
+    return df
 
 
 def resample_prices(close: pd.DataFrame, rebalance: str) -> pd.DataFrame:
@@ -71,12 +76,22 @@ def resample_prices(close: pd.DataFrame, rebalance: str) -> pd.DataFrame:
     raise ValueError("rebalance doit être 'M' ou 'W'")
 
 
-def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+def returns(prices: pd.DataFrame) -> pd.DataFrame:
     return prices.pct_change().replace([np.inf, -np.inf], np.nan)
 
 
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=window).mean()
+def sma(s: pd.Series, window: int) -> pd.Series:
+    return s.rolling(window=window, min_periods=window).mean()
+
+
+def periods_per_year(rebalance: str) -> float:
+    return 12.0 if rebalance == "M" else 52.0
+
+
+def max_drawdown(equity: pd.Series) -> float:
+    peak = equity.cummax()
+    dd = equity / peak - 1.0
+    return float(dd.min())
 
 
 def safe_div(a: float, b: float) -> float:
@@ -85,57 +100,63 @@ def safe_div(a: float, b: float) -> float:
     return a / b
 
 
-def max_drawdown(equity: pd.Series) -> float:
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    return float(dd.min())
-
-
-def periods_per_year(rebalance: str) -> float:
-    return 12.0 if rebalance == "M" else 52.0
-
-
-def summarize_performance(equity: pd.Series, rets: pd.Series, ppy: float) -> Dict[str, float]:
+def summarize(equity: pd.Series, rets: pd.Series, ppy: float) -> Dict[str, float]:
     total_return = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
     years = len(rets) / ppy if ppy else np.nan
     cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1 if years and years > 0 else np.nan
     vol = float(rets.std(ddof=0) * math.sqrt(ppy))
     sharpe = safe_div(float(rets.mean() * ppy), vol)
     mdd = max_drawdown(equity)
-    calmar = safe_div(cagr, abs(mdd)) if not np.isnan(mdd) and mdd != 0 else np.nan
+    calmar = safe_div(float(cagr), abs(mdd)) if not np.isnan(mdd) and mdd != 0 else np.nan
     return {
         "Total Return": total_return,
         "CAGR": float(cagr),
-        "Vol (ann.)": vol,
+        "Vol": vol,
         "Sharpe": float(sharpe),
-        "Max Drawdown": float(mdd),
+        "MaxDD": float(mdd),
         "Calmar": float(calmar),
     }
 
 
-def compute_momentum(prices: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
+def fmt_pct(x: float) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    return f"{x*100:.2f}%"
+
+
+def fmt_num(x: float) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    return f"{x:.2f}"
+
+
+def compute_scores(prices_rebal: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if cfg.momentum_mode == "SINGLE":
-        return prices.pct_change(cfg.mom_single_lb)
+        return prices_rebal.pct_change(cfg.mom_single_lb)
     lb1, lb2 = cfg.mom_dual_lb
     w1, w2 = cfg.mom_dual_w
-    return w1 * prices.pct_change(lb1) + w2 * prices.pct_change(lb2)
+    s1 = prices_rebal.pct_change(lb1)
+    s2 = prices_rebal.pct_change(lb2)
+    return w1 * s1 + w2 * s2
 
 
-def market_filter(prices: pd.DataFrame, cfg: BacktestConfig) -> pd.Series:
+def compute_risk_on(prices_rebal: pd.DataFrame, cfg: Config) -> pd.Series:
+    if not cfg.market_filter_on:
+        return pd.Series(True, index=prices_rebal.index)
     a = cfg.market_filter_asset
-    if a not in prices.columns:
-        return pd.Series(True, index=prices.index)
-    ma = sma(prices[a], cfg.market_filter_ma_periods)
-    return (prices[a] > ma).fillna(False).astype(bool)
+    if a not in prices_rebal.columns:
+        return pd.Series(True, index=prices_rebal.index)
+    ma = sma(prices_rebal[a], cfg.market_filter_window)
+    return (prices_rebal[a] > ma).fillna(False).astype(bool)
 
 
-def compute_weights(prices: pd.DataFrame, cfg: BacktestConfig):
-    scores = compute_momentum(prices, cfg)
-    risk_on = market_filter(prices, cfg) if cfg.market_filter_on else pd.Series(True, index=prices.index)
+def compute_weights(prices_rebal: pd.DataFrame, cfg: Config):
+    scores = compute_scores(prices_rebal, cfg)
+    risk_on = compute_risk_on(prices_rebal, cfg)
 
-    w = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    w = pd.DataFrame(0.0, index=prices_rebal.index, columns=prices_rebal.columns)
 
-    for t in prices.index:
+    for t in prices_rebal.index:
         if not bool(risk_on.loc[t]):
             if cfg.risk_off_mode == "DEFENSIVE" and cfg.defensive_asset in w.columns:
                 w.loc[t, cfg.defensive_asset] = 1.0
@@ -159,25 +180,26 @@ def compute_weights(prices: pd.DataFrame, cfg: BacktestConfig):
     return w, scores, risk_on
 
 
-def backtest(prices: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestConfig):
-    r = compute_returns(prices).reindex(prices.index)
-    weights = weights.reindex(prices.index).fillna(0.0)
+def run_backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, fee_bps: float):
+    r = returns(prices_rebal).fillna(0.0)
+    weights = weights.fillna(0.0)
+
+    # poids appliqués sur la période suivante (w_{t-1} * ret_t)
     w_prev = weights.shift(1).fillna(0.0)
 
     turnover = (weights - w_prev).abs().sum(axis=1)
-    fee = (cfg.fee_bps / 10000.0) * turnover
+    fee_rate = fee_bps / 10000.0
+    fees = fee_rate * turnover
 
     ret_gross = (w_prev * r).sum(axis=1).fillna(0.0)
-    ret_net = (ret_gross - fee).fillna(0.0)
+    ret_net = (ret_gross - fees).fillna(0.0)
 
     eq_gross = (1.0 + ret_gross).cumprod()
     eq_net = (1.0 + ret_net).cumprod()
 
     return {
-        "weights": weights,
-        "scores": None,
         "turnover": turnover,
-        "fees": fee,
+        "fees": fees,
         "ret_gross": ret_gross,
         "ret_net": ret_net,
         "eq_gross": eq_gross,
@@ -185,176 +207,206 @@ def backtest(prices: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestConfig):
     }
 
 
-def fmt_pct(x: float) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    return f"{x*100:.2f}%"
-
-
-def load_wide_csv(upload) -> pd.DataFrame:
-    df = pd.read_csv(upload)
-    if df.shape[1] < 2:
-        raise ValueError("CSV invalide: il faut une colonne Date + au moins 1 ticker.")
-    # détecter colonne date
-    date_col = df.columns[0]
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).sort_index()
-    df = df.apply(pd.to_numeric, errors="coerce")
-    df = df.dropna(how="all")
-    return df
-
-
-# ---------------------------
-# Sidebar
-# ---------------------------
+# -----------------------------
+# Sidebar: upload + params
+# -----------------------------
 with st.sidebar:
-    st.header("1) Données (CSV)")
-    st.write("Upload un CSV avec colonnes = tickers (SPY, QQQ, …) et 1ère colonne = Date.")
-    up = st.file_uploader("Upload CSV (wide)", type=["csv"])
+    st.header("1) Données")
+    uploaded = st.file_uploader("Upload CSV (Date + colonnes tickers)", type=["csv"])
 
     st.divider()
     st.header("2) Paramètres")
 
     rebalance = st.selectbox("Fréquence", ["M", "W"], index=0)
     fee_bps = st.number_input("Frais (bps)", 0.0, 200.0, 10.0, 1.0)
-    top_n = st.slider("Top N", 1, 5, 2)
 
     momentum_mode = st.selectbox("Momentum", ["DUAL", "SINGLE"], index=0)
     if momentum_mode == "DUAL":
         lb1 = st.slider("Lookback 1 (périodes)", 1, 12, 3)
         lb2 = st.slider("Lookback 2 (périodes)", 2, 18, 6)
         w1 = st.slider("Poids lookback 1", 0.0, 1.0, 0.5, 0.05)
-        w2 = 1.0 - w1
-        mom_single = 12
+        w2 = 1.0 - float(w1)
+        mom_single_lb = 12
     else:
-        mom_single = st.slider("Lookback single (périodes)", 1, 18, 12)
+        mom_single_lb = st.slider("Lookback single (périodes)", 1, 18, 12)
         lb1, lb2, w1, w2 = 3, 6, 0.5, 0.5
 
-    market_filter_on = st.toggle("Filtre marché ON", value=True)
-    risk_off_mode = st.selectbox("Mode risk-off", ["CASH", "DEFENSIVE"], index=0)
+    top_n = st.slider("Top N", 1, 5, 2)
+    market_filter_on = st.toggle("Filtre marché ON (prix > MA)", value=True)
+    risk_off_mode = st.selectbox("Risk-off", ["CASH", "DEFENSIVE"], index=0)
     long_only = st.toggle("Long-only (score > 0)", value=True)
 
-if up is None:
+if uploaded is None:
     st.info("➡️ Upload un CSV pour démarrer.")
     st.stop()
 
 try:
-    close = load_wide_csv(up)
+    close = load_wide_csv(uploaded)
 except Exception as e:
     st.error(f"Erreur lecture CSV: {e}")
     st.stop()
 
-available = list(close.columns)
-
-st.sidebar.divider()
-st.sidebar.header("3) Choix tickers")
-universe = st.sidebar.multiselect("Univers", options=available, default=[t for t in DEFAULT_UNIVERSE if t in available] or available[: min(8, len(available))])
-if len(universe) < 2:
-    st.error("Choisis au moins 2 tickers dans l'univers.")
+if close.empty:
+    st.error("CSV vide ou non lisible.")
     st.stop()
 
-market_filter_asset = st.sidebar.selectbox("Actif filtre (ex SPY)", options=available, index=available.index("SPY") if "SPY" in available else 0)
-defensive_asset = st.sidebar.selectbox("Actif défensif", options=available, index=available.index("IEF") if "IEF" in available else 0)
-single_ticker = st.sidebar.selectbox("Single-asset", options=available, index=available.index("SPY") if "SPY" in available else 0)
+available = list(close.columns)
 
-# MA window en "périodes" aligné sur rebal
-ma_default = 12 if rebalance == "M" else 52
-ma_periods = st.sidebar.slider("Fenêtre MA (périodes)", 6, 80, ma_default)
+with st.sidebar:
+    st.divider()
+    st.header("3) Choix des tickers")
 
-# Période dates
-st.sidebar.divider()
-start = st.sidebar.date_input("Début", value=pd.to_datetime(close.index.min()).date())
-end = st.sidebar.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
+    default_univ = [t for t in DEFAULT_UNIVERSE if t in available]
+    if len(default_univ) < 2:
+        default_univ = available[: min(8, len(available))]
 
-close = close.loc[(close.index >= pd.to_datetime(str(start))) & (close.index <= pd.to_datetime(str(end)))]
+    universe = st.multiselect("Univers", options=available, default=default_univ)
+    if len(universe) < 2:
+        st.error("Choisis au moins 2 tickers dans l'univers.")
+        st.stop()
+
+    market_filter_asset = st.selectbox(
+        "Actif filtre (ex: SPY)", options=available, index=available.index("SPY") if "SPY" in available else 0
+    )
+    defensive_asset = st.selectbox(
+        "Actif défensif", options=available, index=available.index("IEF") if "IEF" in available else 0
+    )
+    single_ticker = st.selectbox(
+        "Single-asset (comparatif)", options=available, index=available.index(DEFAULT_SINGLE) if DEFAULT_SINGLE in available else 0
+    )
+
+    ma_default = 12 if rebalance == "M" else 52
+    market_filter_window = st.slider("Fenêtre MA (périodes)", 6, 80, ma_default)
+
+    st.divider()
+    st.header("4) Dates")
+    start_d = st.date_input("Début", value=pd.to_datetime(close.index.min()).date())
+    end_d = st.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
+
+# Filtrer dates
+close = close.loc[(close.index >= pd.to_datetime(str(start_d))) & (close.index <= pd.to_datetime(str(end_d)))]
 if close.empty:
     st.error("Aucune donnée dans la plage choisie.")
     st.stop()
 
+# Rebal
 prices_rebal = resample_prices(close, rebalance).dropna(how="all")
 prices_multi = prices_rebal[universe].dropna(how="all")
 
-cfg = BacktestConfig(
-    start=str(start),
-    end=str(end),
+if prices_multi.shape[0] < 20:
+    st.warning("Peu de périodes après rebal. Les stats peuvent être instables.")
+
+cfg = Config(
     rebalance=rebalance,
     fee_bps=float(fee_bps),
     top_n=int(min(top_n, len(universe))),
     market_filter_on=bool(market_filter_on),
     market_filter_asset=str(market_filter_asset),
-    market_filter_ma_periods=int(ma_periods),
+    market_filter_window=int(market_filter_window),
     risk_off_mode=str(risk_off_mode),
     defensive_asset=str(defensive_asset),
     momentum_mode=str(momentum_mode),
-    mom_single_lb=int(mom_single),
+    mom_single_lb=int(mom_single_lb),
     mom_dual_lb=(int(lb1), int(lb2)),
     mom_dual_w=(float(w1), float(w2)),
     long_only=bool(long_only),
 )
 
+# Compute strategy
 weights, scores, risk_on = compute_weights(prices_multi, cfg)
-bt = backtest(prices_multi, weights, cfg)
+bt = run_backtest(prices_multi, weights, cfg.fee_bps)
 
 ppy = periods_per_year(rebalance)
-perf = summarize_performance(bt["eq_net"], bt["ret_net"], ppy)
+perf = summarize(bt["eq_net"], bt["ret_net"], ppy)
 
-# Single asset
-single = prices_rebal[[single_ticker]].dropna()
-single_ret = single[single_ticker].pct_change().fillna(0.0)
+# Single asset comparatif
+single_prices = prices_rebal[[single_ticker]].dropna()
+single_ret = single_prices[single_ticker].pct_change().fillna(0.0)
 single_eq = (1.0 + single_ret).cumprod()
-perf_single = summarize_performance(single_eq, single_ret, ppy)
+perf_single = summarize(single_eq, single_ret, ppy)
 
-# ---------------------------
-# UI
-# ---------------------------
-t1, t2, t3 = st.tabs(["📊 Résumé", "🔍 Diagnostic", "🧾 Message"])
+# -----------------------------
+# UI output
+# -----------------------------
+tab1, tab2, tab3 = st.tabs(["📊 Résumé", "🔍 Diagnostic", "🧾 Message automatique"])
 
-with t1:
+with tab1:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("CAGR", fmt_pct(perf["CAGR"]))
-    c2.metric("Vol (ann.)", fmt_pct(perf["Vol (ann.)"]))
-    c3.metric("Sharpe", f"{perf['Sharpe']:.2f}" if not np.isnan(perf["Sharpe"]) else "—")
-    c4.metric("Max DD", fmt_pct(perf["Max Drawdown"]))
-    c5.metric("Calmar", f"{perf['Calmar']:.2f}" if not np.isnan(perf["Calmar"]) else "—")
+    c2.metric("Vol (ann.)", fmt_pct(perf["Vol"]))
+    c3.metric("Sharpe", fmt_num(perf["Sharpe"]))
+    c4.metric("Max DD", fmt_pct(perf["MaxDD"]))
+    c5.metric("Calmar", fmt_num(perf["Calmar"]))
 
-    eq = pd.DataFrame({"Multi (net)": bt["eq_net"], f"Single ({single_ticker})": single_eq.reindex(bt["eq_net"].index).ffill()}).dropna()
+    st.caption(
+        "Multi-asset (net) vs Single-asset buy&hold. Frais appliqués sur turnover à chaque rebal."
+    )
+
+    eq_df = pd.DataFrame(
+        {
+            "Multi (net)": bt["eq_net"],
+            "Multi (brut)": bt["eq_gross"],
+            f"Single ({single_ticker})": single_eq.reindex(bt["eq_net"].index).ffill(),
+        }
+    ).dropna()
 
     st.subheader("Courbe de capital")
-    if px is not None:
-        fig = px.line(eq, x=eq.index, y=eq.columns, labels={"x": "Date", "value": "Capital", "variable": "Série"})
-        fig.update_layout(height=420, legend_title_text="")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.line_chart(eq)
+    st.line_chart(eq_df)
 
-    st.subheader("Allocations récentes")
-    tail_w = weights.tail(12).copy()
-    tail_w.index = tail_w.index.date
-    st.dataframe(tail_w.style.format("{:.0%}"), use_container_width=True)
+    st.subheader("Allocations récentes (cibles)")
+    w_tail = weights.tail(12).copy()
+    w_tail.index = w_tail.index.date
+    st.dataframe(w_tail.style.format("{:.0%}"), use_container_width=True)
 
-with t2:
-    st.subheader("Diagnostic baisse CAGR (ex: 12p → 3p+6p)")
+with tab2:
+    st.subheader("Pourquoi le CAGR peut baisser en 3p+6p (dual) ?")
+    st.write(
+        "- Dual (3+6) réagit plus vite → turnover souvent plus élevé → frais + whipsaws.\n"
+        "- Si risk-off = CASH, tu peux rater des périodes favorables (obligations).\n"
+        "- Tester: poids 0.25/0.75, risk-off DEFENSIVE, ou rebal mensuel."
+    )
+
     risk_on_aligned = risk_on.reindex(bt["eq_net"].index).fillna(False)
     transitions = int((risk_on_aligned.astype(int).diff().abs() > 0).sum())
-    pct_risk_on = float(risk_on_aligned.mean())
+    pct_on = float(risk_on_aligned.mean())
+
+    avg_turn = float(bt["turnover"].mean())
+    avg_fee = float(bt["fees"].mean())
 
     w_prev = weights.shift(1).fillna(0.0)
-    hhi = (w_prev.pow(2).sum(axis=1)).mean()
-    avg_turn = float(bt["turnover"].mean())
+    hhi = float((w_prev.pow(2).sum(axis=1)).mean())  # concentration
 
     d1, d2, d3, d4 = st.columns(4)
-    d1.metric("% Risk-on", f"{pct_risk_on*100:.1f}%")
-    d2.metric("Transitions", f"{transitions}")
-    d3.metric("HHI moyen", f"{hhi:.2f}")
-    d4.metric("Turnover moyen", f"{avg_turn:.2f}")
+    d1.metric("% Risk-on", f"{pct_on*100:.1f}%")
+    d2.metric("Transitions on/off", str(transitions))
+    d3.metric("Turnover moyen", f"{avg_turn:.2f}")
+    d4.metric("Concentration (HHI)", f"{hhi:.2f}")
 
-    st.write("➡️ Si le dual momentum baisse le CAGR, c’est souvent turnover↑ + whipsaws↑. Essaie w=0.25/0.75 et/ou DEFENSIVE.")
+    st.caption("HHI proche de 1.0 = très concentré. Turnover élevé = plus de frais et plus de changements.")
 
-with t3:
-    st.subheader("Message automatique")
-    last_dt = prices_multi.index[-1]
-    is_on = bool(risk_on.loc[last_dt]) if last_dt in risk_on.index else True
-    alloc = weights.loc[last_dt]
+    st.subheader("Dernier signal")
+    last_t = prices_multi.index[-1]
+    last_scores = scores.loc[last_t].dropna().sort_values(ascending=False)
+    last_alloc = weights.loc[last_t][weights.loc[last_t] > 0].sort_values(ascending=False)
+
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("**Scores momentum (dernier)**")
+        st.dataframe(last_scores.to_frame("Score").style.format("{:.2%}"), use_container_width=True)
+    with colR:
+        st.markdown("**Allocation cible (dernier)**")
+        if last_alloc.empty:
+            st.info("Aucune position (CASH ou défensif selon paramètres).")
+        else:
+            st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
+
+with tab3:
+    st.subheader("Message automatique (copier/coller)")
+    last_t = prices_multi.index[-1]
+    last_date = last_t.strftime("%Y-%m-%d")
+
+    is_on = bool(risk_on.loc[last_t]) if last_t in risk_on.index else True
+    alloc = weights.loc[last_t]
     alloc = alloc[alloc > 0].sort_values(ascending=False)
 
     if cfg.momentum_mode == "DUAL":
@@ -362,23 +414,38 @@ with t3:
     else:
         mom_desc = f"Single {cfg.mom_single_lb}"
 
-    filt_desc = f"Filtre ON ({cfg.market_filter_asset} > MA{cfg.market_filter_ma_periods})" if cfg.market_filter_on else "Filtre OFF"
+    if cfg.market_filter_on:
+        filt_desc = f"Filtre ON ({cfg.market_filter_asset} > MA{cfg.market_filter_window})"
+    else:
+        filt_desc = "Filtre OFF"
 
     if not is_on:
-        pos = f"Risk-off: {cfg.risk_off_mode}" + (f" (100% {cfg.defensive_asset})" if cfg.risk_off_mode == "DEFENSIVE" else "")
+        if cfg.risk_off_mode == "DEFENSIVE":
+            pos_line = f"Risk-off: DEFENSIVE (100% {cfg.defensive_asset})"
+        else:
+            pos_line = "Risk-off: CASH (0% exposé)"
     else:
-        pos = "Allocation: " + (", ".join([f"{t}:{w:.0%}" for t, w in alloc.items()]) if not alloc.empty else "CASH/DEF")
+        if alloc.empty:
+            pos_line = "Allocation: CASH/DEF (aucun score positif)"
+        else:
+            parts = [f"{t}: {int(round(w*100))}%" for t, w in alloc.items()]
+            pos_line = "Allocation: " + ", ".join(parts)
 
-    msg = f"""
-📌 **Trading Bot — Signal {last_dt.strftime('%Y-%m-%d')}**
-- Univers: {", ".join(universe)}
-- Rebal: {"mensuel" if cfg.rebalance=="M" else "hebdo"} | Frais: {cfg.fee_bps:.1f} bps
-- Momentum: {mom_desc}
-- {filt_desc} | Risk-on: {"OUI" if is_on else "NON"}
-- {pos}
+    # Message sans f-string complexe (zéro risque de syntax)
+    msg_lines = [
+        f"📌 Trading Bot — Signal {last_date}",
+        f"- Univers: {', '.join(universe)}",
+        f"- Rebal: {'mensuel' if cfg.rebalance == 'M' else 'hebdo'} | Frais: {cfg.fee_bps:.1f} bps",
+        f"- Momentum: {mom_desc}",
+        f"- {filt_desc} | Risk-on: {'OUI' if is_on else 'NON'}",
+        f"- {pos_line}",
+        "",
+        f"📈 Perf (multi, net): CAGR {perf['CAGR']*100:.2f}% | MaxDD {perf['MaxDD']*100:.2f}% | Sharpe {perf['Sharpe']:.2f}",
+        f"📊 Single ({single_ticker}): CAGR {perf_single['CAGR']*100:.2f}% | MaxDD {perf_single['MaxDD']*100:.2f}% | Sharpe {perf_single['Sharpe']:.2f}",
+    ]
+    msg = "\n".join(msg_lines)
 
-📈 Perf (multi, net): CAGR {perf["CAGR"]*100:.2f}% | MaxDD {perf["Max Drawdown"]*100:.2f}% | Sharpe {perf["Sharpe']:.2f if not np.isnan(perf['Sharpe']) else 0:.2f}
-"""
-    st.text_area("Message", value=textwrap.dedent(msg).strip(), height=220)
+    st.text_area("Message", value=msg, height=240)
 
-st.caption("⚠️ Backtest simplifié (pas un conseil financier).")
+st.divider()
+st.caption("⚠️ Backtest simplifié (pas un conseil financier). Slippage/taxes/exécution non inclus.")
