@@ -1,5 +1,4 @@
 streamlit
 pandas
 numpy
-pandas_datareader
 plotly
