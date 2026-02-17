@@ -149,9 +149,12 @@ def rotation_monthly_backtest(
     if len(monthly) < 2:
         raise ValueError("Pas assez de données mensuelles. Vérifie les tickers et les dates.")
 
-    mdf = pd.DataFrame(monthly).dropna(how="any")
-    mom = mdf.pct_change(lookback_months)
+   mdf = pd.DataFrame(monthly).dropna(how="any")
 
+# Double momentum 3 mois + 6 mois
+mom_3 = mdf.pct_change(3)
+mom_6 = mdf.pct_change(6)
+mom = (mom_3 + mom_6) / 2
     if market_filter_on:
         if market_symbol not in mdf.columns:
             raise ValueError(f"Market symbol {market_symbol} absent des données.")
@@ -422,3 +425,4 @@ Note: Ceci est un backtest (simulation), pas un conseil financier.
 
     except Exception as e:
         st.exception(e)
+
