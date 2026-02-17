@@ -1,6 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+
+st.set_page_config(page_title="Bot Trading (V4)", layout="wide")
+st.title("🤖 Bot Trading — Démo publique (V4)")
+st.caption("Backtests + signaux. Aucun ordre réel. Données: Stooq.")
+
+# -----------------------------
+# Data (robuste)
+# -----------------------------
 @st.cache_data(ttl=60 * 60)
 def safe_download_prices(ticker: str) -> pd.DataFrame:
     url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
@@ -13,32 +21,18 @@ def safe_download_prices(ticker: str) -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
-    
-st.set_page_config(page_title="Bot Trading (Démo)", layout="wide")
-st.title("🤖 Bot Trading — Démo publique (V4)")
-st.caption("Backtests + signaux. Aucun ordre réel. Données: Stooq.")
-
-# -----------------------------
-# Data
-# -----------------------------
-@st.cache_data(ttl=60 * 60)
-def download_prices(ticker: str) -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
-    df = pd.read_csv(url)
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").set_index("Date")
-    return df
 
 def clip_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
     d = df.copy()
     return d[(d.index >= pd.to_datetime(start)) & (d.index <= pd.to_datetime(end))]
 
 def to_monthly_close(df: pd.DataFrame) -> pd.Series:
-    # dernier Close de chaque mois
     return df["Close"].resample("M").last().dropna()
 
 # -----------------------------
-# Indicators
+# Indicators (single-asset)
 # -----------------------------
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
@@ -66,7 +60,7 @@ def run_backtest_single(df: pd.DataFrame, position: pd.Series, fee_bps: float) -
     d["ret"] = d["Close"].pct_change().fillna(0)
 
     pos = position.fillna(0).astype(float)
-    d["position"] = pos.shift(1).fillna(0)  # exécuté le lendemain
+    d["position"] = pos.shift(1).fillna(0)  # exécution le lendemain
     d["trade"] = d["position"].diff().abs().fillna(0)
 
     fee = (fee_bps / 10000.0)
@@ -77,7 +71,7 @@ def run_backtest_single(df: pd.DataFrame, position: pd.Series, fee_bps: float) -
     d["buy_hold"] = (1 + d["ret"]).cumprod()
     return d
 
-def stats_from_equity(d: pd.DataFrame, ret_col: str = "strategy_ret", equity_col: str = "equity") -> dict:
+def stats_from_equity(d: pd.DataFrame, ret_col: str, equity_col: str) -> dict:
     eq = d[equity_col].dropna()
     if len(eq) < 2:
         return {}
@@ -93,7 +87,7 @@ def stats_from_equity(d: pd.DataFrame, ret_col: str = "strategy_ret", equity_col
     daily = d[ret_col].dropna()
     sharpe = 0.0 if daily.std() == 0 else (daily.mean() / daily.std()) * np.sqrt(252)
 
-    trades = int(d.get("trade", pd.Series([0])).sum())
+    trades = int(d.get("trade", pd.Series([0.0])).sum())
     return {
         "Rendement total": total_return,
         "CAGR (approx.)": cagr,
@@ -145,115 +139,90 @@ def rotation_monthly_backtest(
     market_ma_months: int,
     fee_bps: float,
 ):
-    """
-    - Universe: keys(prices_daily) ex: SPY, QQQ, TLT, GLD (en tickers Stooq)
-    - Mensuel: choisit top_k selon momentum (perf sur lookback_months).
-    - Filtre marché: si marché sous MA -> bascule sur defensifs.
-    - Retour: DataFrame mensuel + equity mensuelle (puis convertie en daily equity approx via forward-fill pour affichage simple).
-    """
-    # 1) Série mensuelle de clôture
     monthly = {}
     for sym, df in prices_daily.items():
         d = clip_dates(df, start, end)
-        if d.empty:
+        if d.empty or "Close" not in d.columns:
             continue
         monthly[sym] = to_monthly_close(d)
 
     if len(monthly) < 2:
-        raise ValueError("Pas assez de données mensuelles. Essaie des dates plus récentes ou d’autres tickers.")
+        raise ValueError("Pas assez de données mensuelles. Vérifie les tickers et les dates.")
 
-    mdf = pd.DataFrame(monthly).dropna(how="any")  # mêmes mois pour tout le monde
-
-    # 2) Momentum (retour sur lookback)
+    mdf = pd.DataFrame(monthly).dropna(how="any")
     mom = mdf.pct_change(lookback_months)
 
-    # 3) Market filter (sur mensuel)
     if market_filter_on:
         if market_symbol not in mdf.columns:
             raise ValueError(f"Market symbol {market_symbol} absent des données.")
         mkt = mdf[market_symbol]
         mkt_ma = mkt.rolling(market_ma_months).mean()
-        risk_on = (mkt > mkt_ma).astype(int)  # 1 si risk-on
+        risk_on = (mkt > mkt_ma).astype(int)
     else:
         risk_on = pd.Series(1, index=mdf.index)
 
-    # 4) Portefeuille mensuel + frais (simple)
     weights = pd.DataFrame(0.0, index=mdf.index, columns=mdf.columns)
 
     for t in range(len(mdf.index)):
         date = mdf.index[t]
-
         if t < lookback_months:
-            continue  # pas assez d'historique
-
-        # Choix univers selon risk_on
-        if int(risk_on.iloc[t]) == 1:
-            universe = risky_assets
-        else:
-            universe = defensive_assets
-
-        # garde seulement ceux présents
-        universe = [u for u in universe if u in mdf.columns]
-        if len(universe) == 0:
             continue
 
-        # classe par momentum
+        universe = risky_assets if int(risk_on.iloc[t]) == 1 else defensive_assets
+        universe = [u for u in universe if u in mdf.columns]
+        if not universe:
+            continue
+
         ranks = mom.loc[date, universe].sort_values(ascending=False)
         picks = list(ranks.head(top_k).index)
-
-        # poids égaux
         w = 1.0 / len(picks)
         for p in picks:
             weights.loc[date, p] = w
 
     weights = weights.fillna(0.0)
 
-    # 5) Rendements mensuels
     mret = mdf.pct_change().fillna(0.0)
 
-    # 6) Frais sur turnover mensuel
-    # turnover = somme(|w_t - w_{t-1}|)
     turnover = weights.diff().abs().sum(axis=1).fillna(0.0)
     fee = (fee_bps / 10000.0) * turnover
 
     strat_mret = (weights.shift(1).fillna(0.0) * mret).sum(axis=1) - fee
     equity_m = (1 + strat_mret).cumprod()
 
-    # 7) Buy & Hold référence (ex: 100% SPY mensuel)
     bh_mret = mret[market_symbol].fillna(0.0) if market_symbol in mret.columns else mret.mean(axis=1)
     bh_equity_m = (1 + bh_mret).cumprod()
 
-    out = pd.DataFrame({
-        "strategy_ret_m": strat_mret,
-        "equity_m": equity_m,
-        "buy_hold_m": bh_equity_m,
-        "turnover": turnover,
-        "fee_m": fee,
-        "risk_on": risk_on,
-    }, index=mdf.index)
+    out_m = pd.DataFrame(
+        {
+            "strategy_ret_m": strat_mret,
+            "equity_m": equity_m,
+            "buy_hold_m": bh_equity_m,
+            "turnover": turnover,
+            "fee_m": fee,
+            "risk_on": risk_on,
+        },
+        index=mdf.index,
+    )
 
-    # Pour affichage daily simple: on forward-fill l'équité mensuelle sur les dates daily du market_symbol
     daily_index = clip_dates(prices_daily[market_symbol], start, end).index
-    out_daily = pd.DataFrame(index=daily_index)
-    out_daily["equity"] = out["equity_m"].reindex(daily_index, method="ffill")
-    out_daily["buy_hold"] = out["buy_hold_m"].reindex(daily_index, method="ffill")
+    out_d = pd.DataFrame(index=daily_index)
+    out_d["equity"] = out_m["equity_m"].reindex(daily_index, method="ffill")
+    out_d["buy_hold"] = out_m["buy_hold_m"].reindex(daily_index, method="ffill")
+    out_d["strategy_ret"] = out_d["equity"].pct_change().fillna(0.0)
+    out_d["ret"] = out_d["buy_hold"].pct_change().fillna(0.0)
 
-    # daily pseudo returns pour stats (approx)
-    out_daily["strategy_ret"] = out_daily["equity"].pct_change().fillna(0.0)
-    out_daily["ret"] = out_daily["buy_hold"].pct_change().fillna(0.0)
-
-    return out, out_daily, weights
+    return out_m, out_d, weights
 
 # -----------------------------
 # UI
 # -----------------------------
 st.sidebar.header("Mode")
-mode = st.sidebar.selectbox("Choisis un mode", [
-    "Single-asset (MA / RSI / MACD)",
-    "Multi-asset (Rotation mensuelle)",
-])
+mode = st.sidebar.selectbox(
+    "Choisis un mode",
+    ["Single-asset (MA / RSI / MACD)", "Multi-asset (Rotation mensuelle)"],
+)
 
-start = st.sidebar.date_input("Début", value=pd.to_datetime("2018-01-01"))
+start = st.sidebar.date_input("Début", value=pd.to_datetime("2010-01-01"))
 end = st.sidebar.date_input("Fin", value=pd.to_datetime("2025-12-31"))
 fee_bps = st.sidebar.slider("Frais (bps)", 0, 50, 10)
 
@@ -268,7 +237,7 @@ if not run:
 # -----------------------------
 if mode.startswith("Single-asset"):
     st.sidebar.subheader("Single-asset")
-    ticker = st.sidebar.text_input("Ticker (Stooq)", value="aapl.us", help="Ex: aapl.us, msft.us, nvda.us, tsla.us, ry.ca")
+    ticker = st.sidebar.text_input("Ticker (Stooq)", value="aapl.us")
 
     strategy = st.sidebar.selectbox("Stratégie", ["Moyennes mobiles (MA)", "RSI (mean-reversion)", "MACD (trend)"])
 
@@ -285,9 +254,9 @@ if mode.startswith("Single-asset"):
         macd_sig = st.sidebar.slider("MACD signal", 5, 20, 9)
 
     try:
-        prices = download_prices(ticker)
+        prices = safe_download_prices(ticker)
         prices = clip_dates(prices, str(start), str(end))
-        if prices.empty or "Close" not in prices.columns:
+        if prices.empty:
             st.error("Données indisponibles. Essaie un autre ticker.")
             st.stop()
 
@@ -316,35 +285,16 @@ if mode.startswith("Single-asset"):
         c3.metric("Sharpe", f"{s['Sharpe (approx.)']:.2f}")
         c4.metric("Max DD", f"{s['Max drawdown']*100:.2f}%")
         c5.metric("Trades", f"{s['Trades (approx.)']}")
-        
-st.subheader("📝 Message automatique (prêt à publier)")
 
-        valid = out_m.dropna()
-        if valid.empty:
-            st.warning("Pas assez de données pour générer un message.")
-        else:
-            last_date = valid.index[-1]
-            last_row = out_m.loc[last_date]
-            last_weights = w.loc[last_date]
+        st.subheader("Équité (Stratégie vs Buy & Hold)")
+        st.line_chart(pd.DataFrame({"Stratégie": d["equity"], "Buy & Hold": d["buy_hold"]}))
 
-            alloc = last_weights[last_weights > 0].sort_values(ascending=False)
-            alloc_text = ", ".join([f"{sym.upper()} {int(weight*100)}%" for sym, weight in alloc.items()])
-            regime_text = "RISK-ON ✅" if int(last_row["risk_on"]) == 1 else "RISK-OFF 🛡️"
+        st.subheader("Dernier signal")
+        last = d.dropna().iloc[-1]
+        st.info(f"Au {last.name.date()} : {'📈 LONG' if last['position'] == 1 else '📉 CASH'}")
 
-            msg = f"""📊 Rapport stratégie (Rotation Multi-Asset)
-
-Performance:
-• CAGR: {s['CAGR (approx.)']*100:.2f}%
-• Sharpe: {s['Sharpe (approx.)']:.2f}
-• Max Drawdown: {s['Max drawdown']*100:.2f}%
-
-État actuel ({last_date.date()}):
-• Régime marché: {regime_text}
-• Allocation: {alloc_text}
-"""
-
-            st.text_area("Message", msg, height=220)
-            st.download_button("Télécharger le message (.txt)", msg, file_name="rapport_rotation.txt")
+        st.subheader("Données (dernier 250 jours)")
+        st.dataframe(d[["Close", "position", "strategy_ret", "equity", "buy_hold"]].tail(250), use_container_width=True)
 
     except Exception as e:
         st.exception(e)
@@ -355,11 +305,16 @@ Performance:
 else:
     st.sidebar.subheader("Multi-asset (Rotation mensuelle)")
 
-    st.sidebar.caption("Tickers Stooq pour ETF US (souvent): spy.us, qqq.us, tlt.us, gld.us")
-    spy = st.sidebar.text_input("Marché (SPY)", value="spy.us")
-    qqq = st.sidebar.text_input("Tech (QQQ)", value="qqq.us")
-    tlt = st.sidebar.text_input("Obligations (TLT)", value="tlt.us")
-    gld = st.sidebar.text_input("Or (GLD)", value="gld.us")
+    # Univers étendu
+    spy = st.sidebar.text_input("SPY (US Large)", value="spy.us")
+    qqq = st.sidebar.text_input("QQQ (Tech)", value="qqq.us")
+    efa = st.sidebar.text_input("EFA (Intl Dev)", value="efa.us")
+    eem = st.sidebar.text_input("EEM (Emerging)", value="eem.us")
+    vnq = st.sidebar.text_input("VNQ (Real Estate)", value="vnq.us")
+
+    tlt = st.sidebar.text_input("TLT (Long Bonds)", value="tlt.us")
+    ief = st.sidebar.text_input("IEF (Mid Bonds)", value="ief.us")
+    gld = st.sidebar.text_input("GLD (Gold)", value="gld.us")
 
     lookback = st.sidebar.slider("Lookback momentum (mois)", 1, 12, 3)
     top_k = st.sidebar.slider("Nombre d'actifs sélectionnés", 1, 3, 2)
@@ -368,16 +323,34 @@ else:
     market_ma = st.sidebar.slider("MA marché (mois)", 6, 24, 12)
 
     try:
-        # download
         prices = {
-            spy: download_prices(spy),
-            qqq: download_prices(qqq),
-            tlt: download_prices(tlt),
-            gld: download_prices(gld),
+            spy: safe_download_prices(spy),
+            qqq: safe_download_prices(qqq),
+            efa: safe_download_prices(efa),
+            eem: safe_download_prices(eem),
+            vnq: safe_download_prices(vnq),
+            tlt: safe_download_prices(tlt),
+            ief: safe_download_prices(ief),
+            gld: safe_download_prices(gld),
         }
 
-        risky_assets = [spy, qqq]
-        defensive_assets = [tlt, gld]
+        # Nettoyage: garder seulement ceux qui ont des données
+        clean_prices = {}
+        for sym, df in prices.items():
+            d = clip_dates(df, str(start), str(end))
+            if d is not None and not d.empty and "Close" in d.columns:
+                clean_prices[sym] = df
+        prices = clean_prices
+
+        if spy not in prices:
+            st.error("SPY n'a pas de données. Vérifie le ticker (spy.us) ou ajuste les dates.")
+            st.stop()
+
+        risky_assets = [spy, qqq, efa, eem, vnq]
+        defensive_assets = [tlt, ief, gld]
+
+        risky_assets = [x for x in risky_assets if x in prices]
+        defensive_assets = [x for x in defensive_assets if x in prices]
 
         out_m, out_d, w = rotation_monthly_backtest(
             prices_daily=prices,
@@ -411,15 +384,41 @@ else:
         st.subheader("Journal mensuel (dernier 24 mois)")
         st.dataframe(out_m.tail(24), use_container_width=True)
 
-        st.info(
-            "Astuce: commence avec Lookback=3 mois, Top=2, Filtre marché ON. "
-            "Puis compare avec Filtre OFF pour voir l'impact sur le drawdown."
-        )
+        # --------- Message automatique (prêt à publier) ----------
+        st.subheader("📝 Message automatique (prêt à publier)")
+
+        valid = out_m.dropna()
+        if valid.empty:
+            st.warning("Pas assez de données pour générer un message (essaie une période plus longue ou ajuste les paramètres).")
+        else:
+            last_date = valid.index[-1]
+            last_row = out_m.loc[last_date]
+            last_weights = w.loc[last_date]
+
+            alloc = last_weights[last_weights > 0].sort_values(ascending=False)
+            alloc_text = ", ".join([f"{sym.upper()} {int(weight*100)}%" for sym, weight in alloc.items()])
+            regime_text = "RISK-ON ✅" if int(last_row["risk_on"]) == 1 else "RISK-OFF 🛡️"
+
+            msg = f"""📊 Rapport stratégie (Rotation Multi-Asset)
+
+Période backtest: {start} → {end}
+
+Performance:
+• CAGR: {s['CAGR (approx.)']*100:.2f}%
+• Sharpe: {s['Sharpe (approx.)']:.2f}
+• Max Drawdown: {s['Max drawdown']*100:.2f}%
+
+État actuel ({pd.to_datetime(last_date).date()}):
+• Régime marché: {regime_text}
+• Allocation: {alloc_text}
+• Filtre marché (MA): {market_ma} mois
+• Frais: {fee_bps} bps
+
+Note: Ceci est un backtest (simulation), pas un conseil financier.
+"""
+
+            st.text_area("Message", msg, height=240)
+            st.download_button("Télécharger le message (.txt)", msg, file_name="rapport_rotation.txt")
 
     except Exception as e:
         st.exception(e)
-
-
-
-
-
