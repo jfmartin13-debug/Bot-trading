@@ -1,24 +1,27 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
-# Trading Bot Streamlit — Stable & Correct (CSV Upload) + Vol Targeting
+# Trading Bot Streamlit — Stable (CSV Upload)
+# + Dual/Single Momentum + Market Filter + Risk-off + Fees
+# + Core/Satellite portfolio (e.g., 80% Core ETF + 20% Bot)
 #
-# Data: upload CSV (no yfinance, no stooq in python).
+# Data: upload CSV (no yfinance / no external provider).
 # Modes:
 #   A) One "wide" CSV: Date + columns tickers
-#   B) Many CSVs: one file per ticker (we merge automatically)
+#   B) Many CSVs: one file per ticker (auto-merge)
 #
-# Strategy (Multi-asset):
+# Strategy (Satellite = Bot):
 #   - Universe: user-selected
-#   - Dual or Single momentum (monthly/weekly periods)
-#   - Market filter: (filter_asset price > SMA(window)) => Risk-on else Risk-off
+#   - Dual or Single momentum (monthly/weekly)
+#   - Market filter: filter_asset price > SMA(window) => Risk-on else Risk-off
 #   - Top N equal weight on Risk-on
 #   - Risk-off: CASH or 100% DEFENSIVE asset
 #   - Fees: bps on turnover (turnover = 0.5 * sum(|Δw|))
 #
-# Optional: Volatility Targeting (light)
-#   - Compute rolling realized vol of strategy returns (past only, shift 1)
-#   - Scale exposure between min_exposure and max_exposure to target annual vol
-#   - Unused exposure goes to DEFENSIVE (or CASH)
+# Core:
+#   - Buy & hold on single_ticker
+#
+# Combined:
+#   - combo_ret = core_weight*core_ret + sat_weight*bot_ret
 #
 # requirements.txt:
 #   streamlit
@@ -43,8 +46,7 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(page_title="Trading Bot (CSV)", page_icon="📈", layout="wide")
 st.title("📈 Trading Bot — Multi-asset + Single-asset (Dual Momentum) — CSV")
-st.caption("Version stable : upload CSV, filtre marché + risk-off corrects, frais réalistes, + Vol Targeting optionnel.")
-
+st.caption("Version stable : upload CSV, filtre marché + risk-off corrects, frais réalistes, + Core/Satellite combiné.")
 
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "EFA", "EEM", "VNQ", "TLT", "IEF", "GLD"]
 DEFAULT_SINGLE = "SPY"
@@ -68,7 +70,7 @@ class Config:
 
     market_filter_on: bool
     market_filter_asset: str
-    market_filter_window: int           # in rebalance periods (e.g., 12 months)
+    market_filter_window: int
 
     risk_off_mode: str                  # "CASH" or "DEFENSIVE"
     defensive_asset: str
@@ -93,11 +95,6 @@ def _detect_price_col(df: pd.DataFrame) -> Optional[str]:
 
 
 def load_wide_csv(file) -> pd.DataFrame:
-    """
-    Expected:
-      Date,SPY,QQQ,...
-      2006-01-03,....
-    """
     df = pd.read_csv(file)
     if df.shape[1] < 2:
         raise ValueError("CSV invalide : il faut une colonne Date + au moins 1 colonne ticker.")
@@ -120,10 +117,6 @@ def infer_ticker_from_filename(filename: str) -> str:
 
 
 def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """
-    Each file must have a Date column + a price column (Close/Adj Close).
-    Ticker inferred from filename (SPY.csv -> SPY, eem_us_d.csv -> EEM).
-    """
     frames = []
     tickers = []
     problems = []
@@ -236,12 +229,9 @@ def compute_scores(prices_rebal: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def compute_risk_on(prices_rebal: pd.DataFrame, cfg: Config) -> pd.Series:
     if not cfg.market_filter_on:
         return pd.Series(True, index=prices_rebal.index)
-
     a = cfg.market_filter_asset
     if a not in prices_rebal.columns:
-        # If filter asset missing, default risk-on
         return pd.Series(True, index=prices_rebal.index)
-
     ma = sma(prices_rebal[a], cfg.market_filter_window)
     return (prices_rebal[a] > ma).fillna(False).astype(bool)
 
@@ -254,7 +244,6 @@ def build_weights(prices_rebal: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame
 
     for t in prices_rebal.index:
         if not bool(risk_on.loc[t]):
-            # Risk-off allocation
             if cfg.risk_off_mode == "DEFENSIVE" and cfg.defensive_asset in w.columns:
                 w.loc[t, cfg.defensive_asset] = 1.0
             continue
@@ -307,51 +296,6 @@ def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, fee_bps: float) 
         "eq_gross": eq_gross,
         "eq_net": eq_net,
     }
-
-
-def apply_vol_targeting(
-    base_ret: pd.Series,
-    defensive_ret: pd.Series,
-    risk_on: pd.Series,
-    ppy: float,
-    vol_lb: int,
-    target_vol: float,
-    min_expo: float,
-    max_expo: float,
-    risk_off_mode: str,
-) -> Tuple[pd.Series, pd.Series]:
-    """
-    Vol targeting (light, no look-ahead):
-      - ann_vol_t uses rolling std up to t-1 (shift 1)
-      - scale_t = clip(target_vol / ann_vol_t, [min_expo, max_expo])
-      - only applies when risk_on is True; otherwise scale=1 (already risk-off)
-      - return_t = scale_t * base_ret_t + (1-scale_t) * defensive_ret_t (or 0 if CASH)
-    """
-    base_ret = base_ret.copy().fillna(0.0)
-    defensive_ret = defensive_ret.reindex(base_ret.index).fillna(0.0)
-    risk_on = risk_on.reindex(base_ret.index).fillna(True).astype(bool)
-
-    # rolling annualized vol (past only)
-    roll_std = base_ret.rolling(vol_lb, min_periods=vol_lb).std(ddof=0)
-    ann_vol = roll_std * math.sqrt(ppy)
-    ann_vol_lag = ann_vol.shift(1)
-
-    scale = pd.Series(1.0, index=base_ret.index)
-    raw = target_vol / ann_vol_lag
-    raw = raw.replace([np.inf, -np.inf], np.nan)
-
-    scale = raw.clip(lower=min_expo, upper=max_expo)
-    scale = scale.fillna(1.0)
-
-    # If risk-off (filter says OFF), do not apply scaling on top (we're already defensive/cash)
-    scale = scale.where(risk_on, 1.0)
-
-    if risk_off_mode == "CASH":
-        ret_vt = scale * base_ret  # leftover to cash = 0
-    else:
-        ret_vt = scale * base_ret + (1.0 - scale) * defensive_ret
-
-    return ret_vt.fillna(0.0), scale
 
 
 # -----------------------------
@@ -438,14 +382,6 @@ with st.sidebar:
     long_only = st.toggle("Long-only (ignore scores ≤ 0)", value=False)
 
     st.divider()
-    st.header("Volatility Targeting (optionnel)")
-    vt_on = st.toggle("Vol targeting ON", value=False)
-    vt_lb = st.slider("Lookback vol (périodes)", 3, 24, 6, 1)
-    vt_target = st.slider("Vol cible annuelle", 0.05, 0.25, 0.12, 0.01)
-    vt_min = st.slider("Exposition min", 0.0, 1.0, 0.50, 0.05)
-    vt_max = st.slider("Exposition max", 0.1, 1.5, 1.00, 0.05)
-
-    st.divider()
     st.header("3) Choix tickers")
     default_univ = [t for t in DEFAULT_UNIVERSE if t in available]
     if len(default_univ) < 2:
@@ -462,8 +398,14 @@ with st.sidebar:
     end_d = st.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
 
     st.divider()
-    st.header("Single-asset")
-    single_ticker = st.selectbox("Actif buy&hold", options=available, index=available.index(DEFAULT_SINGLE) if DEFAULT_SINGLE in available else 0)
+    st.header("Core (buy & hold)")
+    single_ticker = st.selectbox("ETF core", options=available, index=available.index(DEFAULT_SINGLE) if DEFAULT_SINGLE in available else 0)
+
+    st.divider()
+    st.header("Portefeuille combiné")
+    sat_weight_pct = st.slider("Poids du bot (%)", 0, 50, 20, 5)
+    sat_weight = sat_weight_pct / 100.0
+    core_weight = 1.0 - sat_weight
 
 
 # Apply date filter
@@ -502,44 +444,25 @@ cfg = Config(
 cols_for_weights = sorted(set(universe + [cfg.defensive_asset, cfg.market_filter_asset]))
 weights, scores, risk_on = build_weights(prices_rebal[cols_for_weights], cfg)
 
-# Backtest base (on weights columns)
+# Backtest satellite bot (on weights columns)
 bt = backtest(prices_rebal[weights.columns], weights, cfg.fee_bps)
 
 ppy = periods_per_year(cfg.rebalance)
-perf_base = summarize(bt["eq_net"], bt["ret_net"], ppy)
+perf_bot = summarize(bt["eq_net"], bt["ret_net"], ppy)
 
-# Defensive return series (for vol targeting residual allocation)
-if cfg.defensive_asset in prices_rebal.columns:
-    defensive_ret = prices_rebal[cfg.defensive_asset].pct_change().fillna(0.0)
-else:
-    defensive_ret = pd.Series(0.0, index=bt["ret_net"].index)
-
-# Apply vol targeting (optional)
-if vt_on:
-    ret_vt, scale = apply_vol_targeting(
-        base_ret=bt["ret_net"],
-        defensive_ret=defensive_ret,
-        risk_on=risk_on,
-        ppy=ppy,
-        vol_lb=int(vt_lb),
-        target_vol=float(vt_target),
-        min_expo=float(vt_min),
-        max_expo=float(vt_max),
-        risk_off_mode=cfg.risk_off_mode,
-    )
-    eq_vt = (1.0 + ret_vt).cumprod()
-    perf_vt = summarize(eq_vt, ret_vt, ppy)
-else:
-    ret_vt = None
-    scale = None
-    eq_vt = None
-    perf_vt = None
-
-# Single buy&hold
+# Core buy&hold
 single_prices = prices_rebal[[single_ticker]].dropna()
 single_ret = single_prices[single_ticker].pct_change().fillna(0.0)
 single_eq = (1.0 + single_ret).cumprod()
-perf_single = summarize(single_eq, single_ret, ppy)
+perf_core = summarize(single_eq, single_ret, ppy)
+
+# Combined portfolio
+bot_ret = bt["ret_net"]
+core_ret = single_ret.reindex(bot_ret.index).fillna(0.0)
+
+combo_ret = core_weight * core_ret + sat_weight * bot_ret
+combo_eq = (1.0 + combo_ret).cumprod()
+perf_combo = summarize(combo_eq, combo_ret, ppy)
 
 # Diagnostics
 risk_on_aligned = risk_on.reindex(weights.index).fillna(False)
@@ -548,88 +471,67 @@ pct_risk_on = float(risk_on_aligned.mean())
 avg_turn = float(bt["turnover"].mean())
 sum_fees = float(bt["fees"].sum())
 
+
 # -----------------------------
 # UI
 # -----------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Résumé", "🔍 Diagnostic", "🧾 Message automatique"])
 
 with tab1:
-    st.subheader("Performance (multi-asset)")
+    st.subheader("Satellite (Bot) — performance")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("CAGR (bot)", fmt_pct(perf_bot["CAGR"]))
+    c2.metric("Vol (ann.)", fmt_pct(perf_bot["Vol"]))
+    c3.metric("Sharpe", fmt_num(perf_bot["Sharpe"]))
+    c4.metric("Max DD", fmt_pct(perf_bot["MaxDD"]))
+    c5.metric("Calmar", fmt_num(perf_bot["Calmar"]))
 
-    if vt_on and perf_vt is not None:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("CAGR (net, VT)", fmt_pct(perf_vt["CAGR"]))
-        c2.metric("Vol (ann.)", fmt_pct(perf_vt["Vol"]))
-        c3.metric("Sharpe", fmt_num(perf_vt["Sharpe"]))
-        c4.metric("Max DD", fmt_pct(perf_vt["MaxDD"]))
-        c5.metric("Calmar", fmt_num(perf_vt["Calmar"]))
+    st.subheader("Core (Buy & Hold) — performance")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("CAGR (core)", fmt_pct(perf_core["CAGR"]))
+    d2.metric("Vol (ann.)", fmt_pct(perf_core["Vol"]))
+    d3.metric("Sharpe", fmt_num(perf_core["Sharpe"]))
+    d4.metric("Max DD", fmt_pct(perf_core["MaxDD"]))
+    d5.metric("Calmar", fmt_num(perf_core["Calmar"]))
 
-        st.caption(
-            f"2006–2024 (selon tes dates) | Rebal={cfg.rebalance} | Top {cfg.top_n} | Frais={cfg.fee_bps:.1f} bps | "
-            f"Filtre={'ON' if cfg.market_filter_on else 'OFF'} ({cfg.market_filter_asset}, MA{cfg.market_filter_window}) | "
-            f"Risk-off={cfg.risk_off_mode} ({cfg.defensive_asset}) | Momentum={cfg.momentum_mode} | "
-            f"VT=ON (lb={vt_lb}, cible={vt_target:.2f}, expo={vt_min:.2f}-{vt_max:.2f})"
-        )
-    else:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("CAGR (net)", fmt_pct(perf_base["CAGR"]))
-        c2.metric("Vol (ann.)", fmt_pct(perf_base["Vol"]))
-        c3.metric("Sharpe", fmt_num(perf_base["Sharpe"]))
-        c4.metric("Max DD", fmt_pct(perf_base["MaxDD"]))
-        c5.metric("Calmar", fmt_num(perf_base["Calmar"]))
+    st.subheader(f"Portefeuille combiné — {int(core_weight*100)}% Core / {int(sat_weight*100)}% Bot")
+    e1, e2, e3, e4, e5 = st.columns(5)
+    e1.metric("CAGR (combo)", fmt_pct(perf_combo["CAGR"]))
+    e2.metric("Vol (ann.)", fmt_pct(perf_combo["Vol"]))
+    e3.metric("Sharpe", fmt_num(perf_combo["Sharpe"]))
+    e4.metric("Max DD", fmt_pct(perf_combo["MaxDD"]))
+    e5.metric("Calmar", fmt_num(perf_combo["Calmar"]))
 
-        st.caption(
-            f"2006–2024 (selon tes dates) | Rebal={cfg.rebalance} | Top {cfg.top_n} | Frais={cfg.fee_bps:.1f} bps | "
-            f"Filtre={'ON' if cfg.market_filter_on else 'OFF'} ({cfg.market_filter_asset}, MA{cfg.market_filter_window}) | "
-            f"Risk-off={cfg.risk_off_mode} ({cfg.defensive_asset}) | Momentum={cfg.momentum_mode}"
-        )
+    st.caption(
+        f"Rebal={cfg.rebalance} | Top {cfg.top_n} | Frais={cfg.fee_bps:.1f} bps | "
+        f"Filtre={'ON' if cfg.market_filter_on else 'OFF'} ({cfg.market_filter_asset}, MA{cfg.market_filter_window}) | "
+        f"Risk-off={cfg.risk_off_mode} ({cfg.defensive_asset}) | Momentum={cfg.momentum_mode}"
+    )
 
-    st.subheader("Courbe de capital")
-    if vt_on and eq_vt is not None:
-        eq_df = pd.DataFrame(
-            {
-                "Multi (net, VT)": eq_vt,
-                "Multi (net, base)": bt["eq_net"],
-                f"Single ({single_ticker})": single_eq.reindex(bt["eq_net"].index).ffill(),
-            }
-        ).dropna()
-    else:
-        eq_df = pd.DataFrame(
-            {
-                "Multi (net)": bt["eq_net"],
-                f"Single ({single_ticker})": single_eq.reindex(bt["eq_net"].index).ffill(),
-            }
-        ).dropna()
-
+    st.subheader("Courbes de capital")
+    eq_df = pd.DataFrame(
+        {
+            "Combiné": combo_eq,
+            "Bot (satellite)": bt["eq_net"],
+            f"Core ({single_ticker})": single_eq.reindex(combo_eq.index).ffill(),
+        }
+    ).dropna()
     st.line_chart(eq_df)
 
-    st.subheader("Allocations récentes (cibles)")
+    st.subheader("Allocations récentes (cibles bot)")
     w_tail = weights.tail(12).copy()
     w_tail.index = w_tail.index.date
     st.dataframe(w_tail.style.format("{:.0%}"), use_container_width=True)
 
-    if vt_on and scale is not None:
-        st.subheader("Exposition (Vol Targeting) — récente")
-        s_tail = scale.tail(24).copy()
-        s_tail.index = s_tail.index.date
-        st.line_chart(s_tail)
-
 with tab2:
-    st.subheader("Diagnostic")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("% Risk-on", f"{pct_risk_on*100:.1f}%")
-    d2.metric("Transitions on/off", str(transitions))
-    d3.metric("Turnover moyen", f"{avg_turn:.2f}")
-    d4.metric("Somme frais (approx)", fmt_pct(sum_fees))
+    st.subheader("Diagnostic Bot (satellite)")
+    x1, x2, x3, x4 = st.columns(4)
+    x1.metric("% Risk-on", f"{pct_risk_on*100:.1f}%")
+    x2.metric("Transitions on/off", str(transitions))
+    x3.metric("Turnover moyen", f"{avg_turn:.2f}")
+    x4.metric("Somme frais (approx)", fmt_pct(sum_fees))
 
-    st.write(
-        "Lecture rapide :\n"
-        "- Si DD est trop haut : MA plus réactif (10→9) ou Vol Targeting ON.\n"
-        "- Si Sharpe est trop bas : réduire le bruit (lookbacks plus longs) ou Vol Targeting.\n"
-        "- 2022 est difficile car actions + obligations baissent ensemble : Vol Targeting aide souvent."
-    )
-
-    st.subheader("Dernier signal")
+    st.subheader("Dernier signal bot")
     last_t = weights.index[-1]
     last_scores = scores.loc[last_t].dropna().sort_values(ascending=False)
     last_alloc = weights.loc[last_t][weights.loc[last_t] > 0].sort_values(ascending=False)
@@ -645,12 +547,9 @@ with tab2:
         else:
             st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
 
-    if vt_on and scale is not None:
-        st.subheader("Dernière exposition (VT)")
-        st.write(f"Exposition (scale) au dernier point : **{scale.loc[last_t]:.2f}**")
-
 with tab3:
     st.subheader("Message automatique (copier/coller)")
+
     last_t = weights.index[-1]
     last_date = last_t.strftime("%Y-%m-%d")
     is_on = bool(risk_on_aligned.loc[last_t])
@@ -677,28 +576,23 @@ with tab3:
             parts = [f"{t}: {int(round(w*100))}%" for t, w in alloc.items()]
             pos_line = "Allocation: " + ", ".join(parts)
 
-    if vt_on and perf_vt is not None:
-        perf_line = f"📈 Perf (multi, net, VT): CAGR {perf_vt['CAGR']*100:.2f}% | MaxDD {perf_vt['MaxDD']*100:.2f}% | Sharpe {perf_vt['Sharpe']:.2f}"
-        vt_line = f"- Vol Targeting: ON (lb={vt_lb}, cible={vt_target:.2f}, expo={vt_min:.2f}-{vt_max:.2f})"
-    else:
-        perf_line = f"📈 Perf (multi, net): CAGR {perf_base['CAGR']*100:.2f}% | MaxDD {perf_base['MaxDD']*100:.2f}% | Sharpe {perf_base['Sharpe']:.2f}"
-        vt_line = "- Vol Targeting: OFF"
-
     msg = "\n".join(
         [
             f"📌 Trading Bot — Signal {last_date}",
-            f"- Univers: {', '.join(universe)}",
+            f"- Univers bot: {', '.join(universe)}",
             f"- Rebal: {'mensuel' if cfg.rebalance == 'M' else 'hebdo'} | Frais: {cfg.fee_bps:.1f} bps",
             f"- Momentum: {mom_desc}",
             f"- {filt_desc} | Risk-on: {'OUI' if is_on else 'NON'}",
             f"- {pos_line}",
-            vt_line,
             "",
-            perf_line,
-            f"📊 Single ({single_ticker}): CAGR {perf_single['CAGR']*100:.2f}% | MaxDD {perf_single['MaxDD']*100:.2f}% | Sharpe {perf_single['Sharpe']:.2f}",
+            f"🧩 Portefeuille combiné: {int(core_weight*100)}% Core ({single_ticker}) / {int(sat_weight*100)}% Bot",
+            f"📈 Bot (net): CAGR {perf_bot['CAGR']*100:.2f}% | MaxDD {perf_bot['MaxDD']*100:.2f}% | Sharpe {perf_bot['Sharpe']:.2f}",
+            f"📊 Core ({single_ticker}): CAGR {perf_core['CAGR']*100:.2f}% | MaxDD {perf_core['MaxDD']*100:.2f}% | Sharpe {perf_core['Sharpe']:.2f}",
+            f"✅ Combo: CAGR {perf_combo['CAGR']*100:.2f}% | MaxDD {perf_combo['MaxDD']*100:.2f}% | Sharpe {perf_combo['Sharpe']:.2f}",
         ]
     )
-    st.text_area("Message", value=msg, height=260)
+
+    st.text_area("Message", value=msg, height=280)
 
 st.divider()
 st.caption("⚠️ Backtest simplifié (pas un conseil financier). Slippage/taxes/exécution non inclus.")
