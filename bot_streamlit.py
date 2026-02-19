@@ -1,8 +1,8 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
 # Trading Bot Streamlit — Stable (CSV Upload)
-# + Dual/Single Momentum + Market Filter + Risk-off + Fees
-# + Core/Satellite portfolio (e.g., 80% Core ETF + 20% Bot)
+# + Dual/Single Momentum + Market Filter (SPY MA200 jours) + Risk-off CASH
+# + Fees + Core/Satellite portfolio (e.g., 80% Core ETF + 20% Bot)
 #
 # Data: upload CSV (no yfinance / no external provider).
 # Modes:
@@ -12,9 +12,9 @@
 # Strategy (Satellite = Bot):
 #   - Universe: user-selected
 #   - Dual or Single momentum (monthly/weekly)
-#   - Market filter: filter_asset price > SMA(window) => Risk-on else Risk-off
+#   - Crash filter (extincteur): SPY close > SMA(200 jours) => Risk-on else CASH
 #   - Top N equal weight on Risk-on
-#   - Risk-off: CASH or 100% DEFENSIVE asset
+#   - Risk-off: CASH (0% exposé)
 #   - Fees: bps on turnover (turnover = 0.5 * sum(|Δw|))
 #
 # Core:
@@ -46,7 +46,7 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(page_title="Trading Bot (CSV)", page_icon="📈", layout="wide")
 st.title("📈 Trading Bot — Multi-asset + Single-asset (Dual Momentum) — CSV")
-st.caption("Version stable : upload CSV, filtre marché + risk-off corrects, frais réalistes, + Core/Satellite combiné.")
+st.caption("Version stable : upload CSV, filtre marché (SPY MA200 jours) + risk-off CASH, frais réalistes, + Core/Satellite combiné.")
 
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "EFA", "EEM", "VNQ", "TLT", "IEF", "GLD"]
 DEFAULT_SINGLE = "SPY"
@@ -68,12 +68,12 @@ class Config:
     w_dual: Tuple[float, float]
     long_only: bool
 
+    # Extincteur (verrouillé)
     market_filter_on: bool
-    market_filter_asset: str
-    market_filter_window: int
+    market_filter_asset: str            # "SPY"
+    market_filter_window_days: int      # 200 jours
 
-    risk_off_mode: str                  # "CASH" or "DEFENSIVE"
-    defensive_asset: str
+    risk_off_mode: str                  # "CASH"
 
 
 # -----------------------------
@@ -226,47 +226,53 @@ def compute_scores(prices_rebal: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return w1 * s1 + w2 * s2
 
 
-def compute_risk_on(prices_rebal: pd.DataFrame, cfg: Config) -> pd.Series:
+def compute_risk_on_daily(close_daily: pd.DataFrame, rebal_index: pd.DatetimeIndex, cfg: Config) -> pd.Series:
+    """
+    Extincteur: signal daily SPY > MA(200 jours), puis aligné sur les dates de rebal.
+    Pas de look-ahead: on utilise la dernière valeur connue (ffill).
+    """
     if not cfg.market_filter_on:
-        return pd.Series(True, index=prices_rebal.index)
+        return pd.Series(True, index=rebal_index)
+
     a = cfg.market_filter_asset
-    if a not in prices_rebal.columns:
-        return pd.Series(True, index=prices_rebal.index)
-    ma = sma(prices_rebal[a], cfg.market_filter_window)
-    return (prices_rebal[a] > ma).fillna(False).astype(bool)
+    if a not in close_daily.columns:
+        return pd.Series(True, index=rebal_index)
+
+    px = close_daily[a].dropna()
+    ma = sma(px, cfg.market_filter_window_days)
+    sig_daily = (px > ma).astype(bool)
+
+    # align on rebal dates using last known daily signal
+    sig_rebal = sig_daily.reindex(rebal_index, method="ffill").fillna(False).astype(bool)
+    return sig_rebal
 
 
-def build_weights(prices_rebal: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def build_weights(prices_rebal: pd.DataFrame, risk_on: pd.Series, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     scores = compute_scores(prices_rebal, cfg)
-    risk_on = compute_risk_on(prices_rebal, cfg)
+    risk_on = risk_on.reindex(prices_rebal.index).fillna(False).astype(bool)
 
     w = pd.DataFrame(0.0, index=prices_rebal.index, columns=prices_rebal.columns)
 
     for t in prices_rebal.index:
+        # Risk-off => CASH (tout à 0)
         if not bool(risk_on.loc[t]):
-            if cfg.risk_off_mode == "DEFENSIVE" and cfg.defensive_asset in w.columns:
-                w.loc[t, cfg.defensive_asset] = 1.0
             continue
 
         row = scores.loc[t].dropna()
         if row.empty:
-            if cfg.risk_off_mode == "DEFENSIVE" and cfg.defensive_asset in w.columns:
-                w.loc[t, cfg.defensive_asset] = 1.0
             continue
 
         if cfg.long_only:
             row = row[row > 0]
 
         if row.empty:
-            if cfg.risk_off_mode == "DEFENSIVE" and cfg.defensive_asset in w.columns:
-                w.loc[t, cfg.defensive_asset] = 1.0
             continue
 
         top = row.sort_values(ascending=False).head(cfg.top_n).index.tolist()
         if top:
             w.loc[t, top] = 1.0 / len(top)
 
-    return w, scores, risk_on
+    return w, scores
 
 
 def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, fee_bps: float) -> Dict[str, pd.Series]:
@@ -368,15 +374,25 @@ with st.sidebar:
     top_n = st.slider("Top N", 1, 5, 1)
 
     st.divider()
-    st.header("Filtre marché & Risk-off")
-    market_filter_on = st.toggle("Filtre marché ON (prix > MA)", value=True)
-    market_filter_asset = st.selectbox("Actif filtre", options=available, index=available.index("SPY") if "SPY" in available else 0)
+    st.header("Filtre crash (verrouillé)")
 
-    ma_default = 10 if rebalance == "M" else 40
-    market_filter_window = st.slider("Fenêtre MA (périodes)", 6, 80, ma_default, 1)
+    # Verrouillage extincteur
+    market_filter_on = True
+    st.toggle("Filtre marché ON (SPY > MA200 jours)", value=True, disabled=True)
 
-    risk_off_mode = st.selectbox("Risk-off", ["CASH", "DEFENSIVE"], index=1)
-    defensive_asset = st.selectbox("Actif défensif", options=available, index=available.index("TLT") if "TLT" in available else 0)
+    # Force SPY si dispo
+    if "SPY" in available:
+        market_filter_asset = "SPY"
+        st.selectbox("Actif filtre", options=available, index=available.index("SPY"), disabled=True)
+    else:
+        market_filter_asset = available[0]
+        st.selectbox("Actif filtre", options=available, index=0, disabled=True)
+
+    market_filter_window_days = int(st.number_input("Fenêtre MA (jours)", min_value=50, max_value=400, value=200, step=10, disabled=True))
+
+    # Risk-off CASH (verrouillé)
+    risk_off_mode = "CASH"
+    st.selectbox("Risk-off", ["CASH"], index=0, disabled=True)
 
     st.divider()
     long_only = st.toggle("Long-only (ignore scores ≤ 0)", value=False)
@@ -415,7 +431,7 @@ if close.empty:
     st.stop()
 
 # Keep only needed columns
-needed_cols = sorted(set(universe + [market_filter_asset, defensive_asset, single_ticker]))
+needed_cols = sorted(set(universe + [market_filter_asset, single_ticker]))
 close = close[needed_cols].copy()
 
 prices_rebal = resample_prices(close, rebalance).dropna(how="all")
@@ -433,18 +449,18 @@ cfg = Config(
     lb_dual=(int(lb1), int(lb2)),
     w_dual=(float(w1), float(w2)),
     long_only=bool(long_only),
-    market_filter_on=bool(market_filter_on),
+    market_filter_on=True,
     market_filter_asset=str(market_filter_asset),
-    market_filter_window=int(market_filter_window),
-    risk_off_mode=str(risk_off_mode),
-    defensive_asset=str(defensive_asset),
+    market_filter_window_days=int(market_filter_window_days),
+    risk_off_mode="CASH",
 )
 
-# Build weights on columns used by weights (universe + defensive + filter asset)
-cols_for_weights = sorted(set(universe + [cfg.defensive_asset, cfg.market_filter_asset]))
-weights, scores, risk_on = build_weights(prices_rebal[cols_for_weights], cfg)
+# Build weights on columns used by weights (universe only, CASH = 0)
+cols_for_weights = sorted(set(universe))
+risk_on = compute_risk_on_daily(close_daily=close, rebal_index=prices_rebal.index, cfg=cfg)
+weights, scores = build_weights(prices_rebal[cols_for_weights], risk_on=risk_on, cfg=cfg)
 
-# Backtest satellite bot (on weights columns)
+# Backtest satellite bot
 bt = backtest(prices_rebal[weights.columns], weights, cfg.fee_bps)
 
 ppy = periods_per_year(cfg.rebalance)
@@ -504,8 +520,8 @@ with tab1:
 
     st.caption(
         f"Rebal={cfg.rebalance} | Top {cfg.top_n} | Frais={cfg.fee_bps:.1f} bps | "
-        f"Filtre={'ON' if cfg.market_filter_on else 'OFF'} ({cfg.market_filter_asset}, MA{cfg.market_filter_window}) | "
-        f"Risk-off={cfg.risk_off_mode} ({cfg.defensive_asset}) | Momentum={cfg.momentum_mode}"
+        f"Filtre=ON ({cfg.market_filter_asset}, MA{cfg.market_filter_window_days} jours) | "
+        f"Risk-off=CASH | Momentum={cfg.momentum_mode}"
     )
 
     st.subheader("Courbes de capital")
@@ -542,7 +558,7 @@ with tab2:
         st.dataframe(last_scores.to_frame("Score").style.format("{:.2%}"), use_container_width=True)
     with colR:
         st.markdown("**Allocation cible (dernier)**")
-        if last_alloc.empty:
+        if not bool(risk_on_aligned.loc[last_t]) or last_alloc.empty:
             st.info("Aucune position (CASH).")
         else:
             st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
@@ -562,16 +578,13 @@ with tab3:
     else:
         mom_desc = f"Single {cfg.lb_single}"
 
-    filt_desc = f"Filtre ON ({cfg.market_filter_asset} > MA{cfg.market_filter_window})" if cfg.market_filter_on else "Filtre OFF"
+    filt_desc = f"Filtre ON ({cfg.market_filter_asset} > MA{cfg.market_filter_window_days} jours)"
 
     if not is_on:
-        if cfg.risk_off_mode == "DEFENSIVE":
-            pos_line = f"Risk-off: DEFENSIVE (100% {cfg.defensive_asset})"
-        else:
-            pos_line = "Risk-off: CASH (0% exposé)"
+        pos_line = "Risk-off: CASH (0% exposé)"
     else:
         if alloc.empty:
-            pos_line = "Allocation: CASH/DEF (aucun score)"
+            pos_line = "Allocation: CASH (aucun score)"
         else:
             parts = [f"{t}: {int(round(w*100))}%" for t, w in alloc.items()]
             pos_line = "Allocation: " + ", ".join(parts)
