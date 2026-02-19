@@ -1,23 +1,30 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
-# Streamlit Backtester (CSV) — Core / Satellite
-# - Upload CSVs (wide ou un par ticker)
-# - Satellite: Momentum (SINGLE ou DUAL) + filtre crash (SPY/QQQ + MA jours) + Risk-off CASH
-# - Frais réalistes: bps * turnover (turnover = 0.5 * sum(|Δw|))
-# - Core: Buy & Hold (un ticker)
-# - Combo: core_weight + sat_weight
-# - Test automatique des poids (10/20/30% + personnalisé)
+# Core/Satellite Backtester (Streamlit) — SINGLE FILE
+# - Upload CSV: wide (Date + tickers) OR many CSVs (1 per ticker)
+# - Satellite: Momentum (SINGLE / DUAL) + crash filter (asset MA window days) + Risk-off CASH
+# - Fees: bps * turnover, turnover = 0.5 * sum(|Δw|)
+# - Core: Buy & Hold (one ticker)
+# - Combo: core_weight*core + sat_weight*bot
+# - Weight sweep: 10/20/30/50 + current
+# - Run audit: saves config/stats/weights/equity/risk_on to runs/YYYY-MM-DD_HH-MM-SS_local/
 #
-# Dépendances:
-#   streamlit, pandas, numpy
+# Requirements:
+#   pip install streamlit pandas numpy
+#
+# Run:
+#   streamlit run bot_streamlit.py
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
+import json
 import math
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -29,9 +36,12 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(page_title="Core/Satellite Bot (CSV)", page_icon="📈", layout="wide")
 st.title("📈 Core/Satellite — Bot Momentum (CSV)")
-st.caption("Upload CSV • Filtre crash (MA) • Frais réalistes • Core/Satellite • Tests 10/20/30%.")
+st.caption("Single-file • CSV upload • Filtre crash (MA) • Frais • Core/Satellite • Runs audités")
 
 
+# -----------------------------
+# Defaults
+# -----------------------------
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "EFA", "EEM", "VNQ", "TLT", "IEF", "GLD"]
 DEFAULT_CORE = "SPY"
 
@@ -42,25 +52,44 @@ PRICE_COL_CANDIDATES = [
 
 
 # -----------------------------
-# Config
+# Config dataclasses
 # -----------------------------
 @dataclass(frozen=True)
-class Config:
+class StrategyConfig:
     rebalance: str                      # "M" or "W"
-    fee_bps: float                      # e.g. 10 = 0.10%
-    top_n: int                          # number of assets to hold
-    long_only: bool                     # ignore non-positive momentum
+    top_n: int
+    long_only: bool
 
     momentum_mode: str                  # "SINGLE" or "DUAL"
     lb_single: int
     lb_dual: Tuple[int, int]
-    w_dual: Tuple[float, float]         # weights for dual
+    w_dual: Tuple[float, float]
 
     market_filter_on: bool
     market_filter_asset: str
     market_filter_window_days: int
 
-    risk_off_mode: str                  # "CASH" only in this version
+    risk_off_mode: str                  # "CASH"
+
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    fee_bps: float
+
+
+# -----------------------------
+# Formatting
+# -----------------------------
+def fmt_pct(x: float) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    return f"{x * 100:.2f}%"
+
+
+def fmt_num(x: float) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    return f"{x:.2f}"
 
 
 # -----------------------------
@@ -84,7 +113,7 @@ def _detect_price_col(df: pd.DataFrame) -> Optional[str]:
 def load_wide_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
     if df.shape[1] < 2:
-        raise ValueError("CSV invalide : il faut Date + au moins 1 colonne ticker.")
+        raise ValueError("CSV invalide : il faut une colonne Date + au moins 1 colonne ticker.")
     date_col = _detect_date_col(df)
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
@@ -96,8 +125,7 @@ def load_wide_csv(file) -> pd.DataFrame:
 
 def infer_ticker_from_filename(filename: str) -> str:
     base = os.path.basename(filename)
-    name = base.rsplit(".", 1)[0]  # strip .csv
-    # normalize common patterns
+    name = base.rsplit(".", 1)[0]
     name = name.replace("_us_d", "").replace("_US_D", "")
     name = name.replace(".us", "").replace(".US", "")
     return name.upper()
@@ -117,7 +145,6 @@ def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
                 continue
 
             df.columns = [c.strip() for c in df.columns]
-
             date_col = _detect_date_col(df)
             price_col = _detect_price_col(df)
             if price_col is None:
@@ -148,7 +175,7 @@ def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
 
 
 # -----------------------------
-# Helpers
+# Math / metrics
 # -----------------------------
 def resample_prices(close: pd.DataFrame, rebalance: str) -> pd.DataFrame:
     if rebalance == "M":
@@ -190,22 +217,10 @@ def summarize(eq: pd.Series, ret: pd.Series, ppy: float) -> Dict[str, float]:
     return {"CAGR": float(cagr), "Vol": vol, "Sharpe": float(sharpe), "MaxDD": float(mdd), "Calmar": float(calmar)}
 
 
-def fmt_pct(x: float) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    return f"{x*100:.2f}%"
-
-
-def fmt_num(x: float) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    return f"{x:.2f}"
-
-
 # -----------------------------
-# Strategy: scores / filter / weights / backtest
+# Strategy
 # -----------------------------
-def compute_scores(prices_rebal: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def compute_scores(prices_rebal: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     if cfg.momentum_mode == "SINGLE":
         return prices_rebal.pct_change(cfg.lb_single)
     lb1, lb2 = cfg.lb_dual
@@ -215,20 +230,16 @@ def compute_scores(prices_rebal: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return w1 * s1 + w2 * s2
 
 
-def compute_risk_on_daily(
-    close_daily: pd.DataFrame,
-    rebal_index: pd.DatetimeIndex,
-    cfg: Config,
-) -> pd.Series:
+def compute_risk_on_daily(close_daily: pd.DataFrame, rebal_index: pd.DatetimeIndex, cfg: StrategyConfig) -> pd.Series:
     """
-    Signal crash filter basé sur données daily (SPY/QQQ), MA en jours.
-    Aligné sur les dates de rebal via ffill (pas de look-ahead).
+    Crash filter computed on DAILY data (MA in days), then aligned on rebal dates by ffill.
     """
     if not cfg.market_filter_on:
         return pd.Series(True, index=rebal_index)
 
     a = cfg.market_filter_asset
     if a not in close_daily.columns:
+        # If filter asset missing, treat as "filter disabled" (risk-on)
         return pd.Series(True, index=rebal_index)
 
     px = close_daily[a].dropna()
@@ -239,20 +250,15 @@ def compute_risk_on_daily(
     return sig_rebal
 
 
-def build_weights(
-    prices_rebal: pd.DataFrame,
-    risk_on: pd.Series,
-    cfg: Config
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_weights(prices_rebal: pd.DataFrame, risk_on: pd.Series, cfg: StrategyConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     scores = compute_scores(prices_rebal, cfg)
     risk_on = risk_on.reindex(prices_rebal.index).fillna(False).astype(bool)
 
     w = pd.DataFrame(0.0, index=prices_rebal.index, columns=prices_rebal.columns)
 
     for t in prices_rebal.index:
-        # Risk-off => CASH (tout à 0)
         if not bool(risk_on.loc[t]):
-            continue
+            continue  # CASH
 
         row = scores.loc[t].dropna()
         if row.empty:
@@ -260,28 +266,30 @@ def build_weights(
 
         if cfg.long_only:
             row = row[row > 0]
-
-        if row.empty:
-            continue
+            if row.empty:
+                continue
 
         top = row.sort_values(ascending=False).head(cfg.top_n).index.tolist()
         if top:
             w.loc[t, top] = 1.0 / len(top)
 
-    return w, scores
+    return w, scores, risk_on
 
 
-def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, fee_bps: float) -> Dict[str, pd.Series]:
+# -----------------------------
+# Backtest
+# -----------------------------
+def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestConfig) -> Dict[str, pd.Series]:
     r = prices_rebal.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
     weights = weights.fillna(0.0)
 
-    # Apply previous period weights (no look-ahead)
+    # Apply previous weights (no look-ahead)
     w_prev = weights.shift(1).fillna(0.0)
 
-    # Turnover (one-way)
+    # One-way turnover
     turnover = 0.5 * (weights - w_prev).abs().sum(axis=1)
 
-    fee_rate = fee_bps / 10000.0
+    fee_rate = cfg.fee_bps / 10000.0
     fees = fee_rate * turnover
 
     ret_gross = (w_prev * r).sum(axis=1).fillna(0.0)
@@ -300,30 +308,85 @@ def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, fee_bps: float) 
     }
 
 
+# -----------------------------
+# Runs / audit saving
+# -----------------------------
+def get_runs_dir() -> Path:
+    root = os.getenv("RUNS_DIR", "runs")
+    p = Path(root)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def new_run_dir(prefix: str = "local") -> Path:
+    runs = get_runs_dir()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = runs / f"{stamp}_{prefix}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(x) for x in obj]
+    try:
+        return asdict(obj)  # dataclass
+    except Exception:
+        return str(obj)
+
+
+def save_run(
+    run_dir: Path,
+    config: Dict[str, Any],
+    stats: Dict[str, Any],
+    weights: pd.DataFrame,
+    equity: pd.DataFrame,
+    risk_on: Optional[pd.Series] = None,
+) -> None:
+    (run_dir / "config.json").write_text(json.dumps(_to_jsonable(config), indent=2), encoding="utf-8")
+    (run_dir / "stats.json").write_text(json.dumps(_to_jsonable(stats), indent=2), encoding="utf-8")
+    weights.to_csv(run_dir / "weights.csv", index=True)
+    equity.to_csv(run_dir / "equity.csv", index=True)
+    if risk_on is not None:
+        risk_on.rename("risk_on").to_csv(run_dir / "risk_on.csv", index=True)
+
+
+# -----------------------------
+# Combo runner
+# -----------------------------
 def run_combo(
-    prices_daily: pd.DataFrame,
+    close_daily: pd.DataFrame,
     universe: List[str],
     core_ticker: str,
     sat_weight: float,
-    cfg: Config,
+    strat_cfg: StrategyConfig,
+    bt_cfg: BacktestConfig,
 ) -> Dict[str, object]:
-    # Rebalance prices
-    prices_rebal = resample_prices(prices_daily, cfg.rebalance).dropna(how="all")
+    prices_rebal = resample_prices(close_daily, strat_cfg.rebalance).dropna(how="all")
     if prices_rebal.empty:
-        raise ValueError("Aucune donnée après resampling.")
+        raise ValueError("Aucune donnée après resampling (mensuel/hebdo).")
 
-    # Satellite inputs
-    cols_for_weights = [c for c in universe if c in prices_rebal.columns]
-    if len(cols_for_weights) < 2:
+    # Satellite columns (must exist)
+    sat_cols = [c for c in universe if c in prices_rebal.columns]
+    if len(sat_cols) < 2:
         raise ValueError("Univers satellite : au moins 2 tickers requis (présents dans les données).")
 
-    risk_on = compute_risk_on_daily(prices_daily, prices_rebal.index, cfg)
-    weights, scores = build_weights(prices_rebal[cols_for_weights], risk_on=risk_on, cfg=cfg)
-    bt = backtest(prices_rebal[weights.columns], weights, cfg.fee_bps)
+    # Risk-on signal (daily filter aligned to rebal dates)
+    risk_on = compute_risk_on_daily(close_daily, prices_rebal.index, strat_cfg)
+
+    # Weights
+    weights, scores, risk_on_aligned = build_weights(prices_rebal[sat_cols], risk_on=risk_on, cfg=strat_cfg)
+
+    # Satellite backtest
+    bt = backtest(prices_rebal[weights.columns], weights, bt_cfg)
 
     # Core buy&hold
     if core_ticker not in prices_rebal.columns:
-        raise ValueError("Ticker core introuvable dans les données.")
+        raise ValueError(f"Ticker core '{core_ticker}' introuvable dans les données.")
     core_px = prices_rebal[core_ticker].dropna()
     core_ret = core_px.pct_change().fillna(0.0)
     core_eq = (1.0 + core_ret).cumprod()
@@ -332,23 +395,37 @@ def run_combo(
     bot_ret = bt["ret_net"].reindex(core_ret.index).fillna(0.0)
     core_ret_aligned = core_ret.reindex(bot_ret.index).fillna(0.0)
 
+    # Combo
     core_weight = 1.0 - float(sat_weight)
     combo_ret = core_weight * core_ret_aligned + float(sat_weight) * bot_ret
     combo_eq = (1.0 + combo_ret).cumprod()
 
-    ppy = periods_per_year(cfg.rebalance)
+    # Stats
+    ppy = periods_per_year(strat_cfg.rebalance)
     perf_bot = summarize(bt["eq_net"], bt["ret_net"], ppy)
     perf_core = summarize(core_eq.reindex(combo_eq.index).ffill(), core_ret_aligned, ppy)
     perf_combo = summarize(combo_eq, combo_ret, ppy)
 
-    risk_on_aligned = risk_on.reindex(weights.index).fillna(False).astype(bool)
-    transitions = int((risk_on_aligned.astype(int).diff().abs() > 0).sum())
-    pct_risk_on = float(risk_on_aligned.mean())
+    diag = {
+        "pct_risk_on": float(risk_on_aligned.mean()),
+        "transitions": int((risk_on_aligned.astype(int).diff().abs() > 0).sum()),
+        "avg_turnover": float(bt["turnover"].mean()),
+        "sum_fees": float(bt["fees"].sum()),
+    }
+
+    equity_df = pd.DataFrame(
+        {
+            "Combiné": combo_eq,
+            "Bot (satellite)": bt["eq_net"].reindex(combo_eq.index).ffill(),
+            f"Core ({core_ticker})": core_eq.reindex(combo_eq.index).ffill(),
+        }
+    ).dropna()
 
     return {
         "prices_rebal": prices_rebal,
         "weights": weights,
         "scores": scores,
+        "risk_on": risk_on_aligned,
         "bt": bt,
         "core_eq": core_eq,
         "core_ret": core_ret_aligned,
@@ -357,13 +434,8 @@ def run_combo(
         "perf_bot": perf_bot,
         "perf_core": perf_core,
         "perf_combo": perf_combo,
-        "risk_on": risk_on_aligned,
-        "diagnostic": {
-            "pct_risk_on": pct_risk_on,
-            "transitions": transitions,
-            "avg_turnover": float(bt["turnover"].mean()),
-            "sum_fees": float(bt["fees"].sum()),
-        },
+        "diagnostic": diag,
+        "equity_df": equity_df,
         "core_weight": core_weight,
         "sat_weight": float(sat_weight),
     }
@@ -378,35 +450,35 @@ with st.sidebar:
 
     uploaded_one = None
     uploaded_many = None
-
     if upload_mode == "Un seul CSV (wide)":
         uploaded_one = st.file_uploader("Upload CSV (Date + colonnes tickers)", type=["csv"], accept_multiple_files=False)
     else:
         uploaded_many = st.file_uploader("Upload plusieurs CSV (1 par ticker)", type=["csv"], accept_multiple_files=True)
 
-# Load
-if upload_mode == "Un seul CSV (wide)":
-    if uploaded_one is None:
-        st.info("➡️ Upload un CSV (wide) pour démarrer.")
-        st.stop()
-    try:
+# Load data
+try:
+    if upload_mode == "Un seul CSV (wide)":
+        if uploaded_one is None:
+            st.info("➡️ Upload un CSV (wide) pour démarrer.")
+            st.stop()
         close = load_wide_csv(uploaded_one)
         problems = []
-    except Exception as e:
-        st.error(f"Erreur lecture CSV : {e}")
-        st.stop()
-else:
-    if not uploaded_many:
-        st.info("➡️ Upload plusieurs CSV (un par ticker) pour démarrer.")
-        st.stop()
-    try:
+    else:
+        if not uploaded_many:
+            st.info("➡️ Upload plusieurs CSV (un par ticker) pour démarrer.")
+            st.stop()
         close, tickers_loaded, problems = load_many_csv(uploaded_many)
-    except Exception as e:
-        st.error(f"Erreur lecture CSVs : {e}")
-        st.stop()
+except Exception as e:
+    st.error(f"Erreur chargement CSV : {e}")
+    st.stop()
 
 if close.empty or close.shape[1] < 2:
     st.error("Pas assez de données chargées (au moins 2 tickers requis).")
+    st.stop()
+
+# Ensure datetime index
+if not isinstance(close.index, pd.DatetimeIndex):
+    st.error("Index Date invalide après chargement.")
     st.stop()
 
 if problems:
@@ -420,18 +492,16 @@ available = list(close.columns)
 # -----------------------------
 with st.sidebar:
     st.divider()
-    st.header("2) Paramètres satellite (Bot)")
+    st.header("2) Satellite (Bot)")
 
     rebalance = st.selectbox("Fréquence", ["M", "W"], index=0)
     fee_bps = st.number_input("Frais (bps)", 0.0, 200.0, 10.0, 1.0)
 
-    top_n = st.slider("Top N", 1, min(8, max(1, len(available))), 1)
-
+    max_top = min(8, max(1, len(available)))
+    top_n = st.slider("Top N", 1, max_top, 1)
     long_only = st.toggle("Long-only (ignore scores ≤ 0)", value=False)
 
-    st.divider()
     st.subheader("Momentum")
-
     momentum_mode = st.selectbox("Mode", ["DUAL", "SINGLE"], index=0)
     if momentum_mode == "DUAL":
         lb1 = st.slider("Lookback 1 (périodes)", 1, 12, 3)
@@ -445,7 +515,6 @@ with st.sidebar:
 
     st.divider()
     st.header("3) Filtre crash (extincteur)")
-
     market_filter_on = st.toggle("Activer filtre marché", value=True)
 
     default_filter_asset = "SPY" if "SPY" in available else available[0]
@@ -453,18 +522,8 @@ with st.sidebar:
         "Actif filtre (thermomètre)",
         options=available,
         index=available.index(default_filter_asset),
-        help="Actif utilisé pour décider Risk-on / Risk-off."
     )
-
-    market_filter_window_days = st.slider(
-        "Fenêtre MA (jours)",
-        min_value=50,
-        max_value=400,
-        value=200,
-        step=10,
-        help="MA en jours sur l'actif filtre (données daily)."
-    )
-
+    market_filter_window_days = st.slider("Fenêtre MA (jours)", 50, 400, 300, 10)
     risk_off_mode = st.selectbox("Risk-off", ["CASH"], index=0)
 
     st.divider()
@@ -473,24 +532,21 @@ with st.sidebar:
     if len(default_univ) < 2:
         default_univ = available[: min(8, len(available))]
     universe = st.multiselect("Univers (satellite)", options=available, default=default_univ)
-
     if len(universe) < 2:
-        st.error("Choisis au moins 2 tickers dans l'univers satellite.")
+        st.error("Choisis au moins 2 tickers dans l'univers.")
         st.stop()
 
     st.divider()
     st.header("5) Core / Combo")
-
     core_ticker = st.selectbox(
         "Core (buy & hold)",
         options=available,
         index=available.index(DEFAULT_CORE) if DEFAULT_CORE in available else 0
     )
 
-    sat_weight_pct = st.slider("Poids satellite (%)", 0, 50, 20, 5)
+    sat_weight_pct = st.slider("Poids satellite (%)", 0, 80, 50, 5)
     sat_weight = sat_weight_pct / 100.0
     core_weight = 1.0 - sat_weight
-
     st.caption(f"Combo: {int(core_weight*100)}% Core / {int(sat_weight*100)}% Satellite")
 
     st.divider()
@@ -499,19 +555,19 @@ with st.sidebar:
     end_d = st.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
 
 
-# Apply date filter
+# Apply date range
 close = close.loc[(close.index >= pd.to_datetime(str(start_d))) & (close.index <= pd.to_datetime(str(end_d)))].copy()
 if close.empty:
     st.error("Aucune donnée dans la plage choisie.")
     st.stop()
 
-# Keep only needed columns (universe + filter + core)
+# Keep only required columns
 needed_cols = sorted(set(universe + [market_filter_asset, core_ticker]))
 close = close[needed_cols].copy()
 
-cfg = Config(
+# Build configs
+strat_cfg = StrategyConfig(
     rebalance=str(rebalance),
-    fee_bps=float(fee_bps),
     top_n=int(min(top_n, len(universe))),
     long_only=bool(long_only),
     momentum_mode=str(momentum_mode),
@@ -523,28 +579,28 @@ cfg = Config(
     market_filter_window_days=int(market_filter_window_days),
     risk_off_mode=str(risk_off_mode),
 )
+bt_cfg = BacktestConfig(fee_bps=float(fee_bps))
 
-# Run main combo
+# Run main backtest
 try:
     out = run_combo(
-        prices_daily=close,
+        close_daily=close,
         universe=universe,
         core_ticker=core_ticker,
         sat_weight=sat_weight,
-        cfg=cfg,
+        strat_cfg=strat_cfg,
+        bt_cfg=bt_cfg,
     )
 except Exception as e:
     st.error(f"Erreur backtest : {e}")
     st.stop()
 
 
-# -----------------------------
-# Weight sweep (10/20/30 + custom)
-# -----------------------------
+# Weight sweep
 def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
     rows = []
-    for w in weights_list:
-        o = run_combo(close, universe, core_ticker, w, cfg)
+    for w in sorted(set(weights_list)):
+        o = run_combo(close, universe, core_ticker, w, strat_cfg, bt_cfg)
         rows.append({
             "Poids bot": f"{int(round(w*100))}%",
             "CAGR": o["perf_combo"]["CAGR"],
@@ -552,18 +608,15 @@ def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
             "MaxDD": o["perf_combo"]["MaxDD"],
             "Vol": o["perf_combo"]["Vol"],
         })
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
-
-sweep_weights = sorted(set([0.10, 0.20, 0.30, float(sat_weight)]))
-sweep_df = weight_sweep(sweep_weights)
+sweep_df = weight_sweep([0.10, 0.20, 0.30, 0.50, float(sat_weight)])
 
 
 # -----------------------------
-# UI
+# UI Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Résumé", "🧪 Tests poids", "🔍 Diagnostic", "🧾 Message"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Résumé", "🧪 Tests poids", "🔍 Diagnostic", "🧾 Runs (audit)"])
 
 perf_bot = out["perf_bot"]
 perf_core = out["perf_core"]
@@ -595,20 +648,13 @@ with tab1:
     e5.metric("Calmar", fmt_num(perf_combo["Calmar"]))
 
     st.caption(
-        f"Rebal={cfg.rebalance} | Top {cfg.top_n} | Frais={cfg.fee_bps:.1f} bps | "
-        f"Filtre={'ON' if cfg.market_filter_on else 'OFF'} ({cfg.market_filter_asset}, MA{cfg.market_filter_window_days}j) | "
-        f"Risk-off={cfg.risk_off_mode} | Momentum={cfg.momentum_mode}"
+        f"Rebal={strat_cfg.rebalance} | Top {strat_cfg.top_n} | Frais={bt_cfg.fee_bps:.1f} bps | "
+        f"Filtre={'ON' if strat_cfg.market_filter_on else 'OFF'} ({strat_cfg.market_filter_asset}, MA{strat_cfg.market_filter_window_days}j) | "
+        f"Risk-off={strat_cfg.risk_off_mode} | Momentum={strat_cfg.momentum_mode}"
     )
 
     st.subheader("Courbes de capital (net)")
-    eq_df = pd.DataFrame(
-        {
-            "Combiné": out["combo_eq"],
-            "Bot (satellite)": out["bt"]["eq_net"].reindex(out["combo_eq"].index).ffill(),
-            f"Core ({core_ticker})": out["core_eq"].reindex(out["combo_eq"].index).ffill(),
-        }
-    ).dropna()
-    st.line_chart(eq_df)
+    st.line_chart(out["equity_df"])
 
     st.subheader("Allocations récentes (cibles bot)")
     w_tail = out["weights"].tail(12).copy()
@@ -616,22 +662,16 @@ with tab1:
     st.dataframe(w_tail.style.format("{:.0%}"), use_container_width=True)
 
 with tab2:
-    st.subheader("Tests rapides 10% / 20% / 30% (et ton poids actuel)")
+    st.subheader("Tests 10% / 20% / 30% / 50% + actuel")
     tmp = sweep_df.copy()
-    tmp["CAGR"] = tmp["CAGR"].apply(lambda x: fmt_pct(x))
-    tmp["Vol"] = tmp["Vol"].apply(lambda x: fmt_pct(x))
-    tmp["Sharpe"] = tmp["Sharpe"].apply(lambda x: fmt_num(x))
-    tmp["MaxDD"] = tmp["MaxDD"].apply(lambda x: fmt_pct(x))
+    tmp["CAGR"] = tmp["CAGR"].apply(fmt_pct)
+    tmp["Vol"] = tmp["Vol"].apply(fmt_pct)
+    tmp["Sharpe"] = tmp["Sharpe"].apply(fmt_num)
+    tmp["MaxDD"] = tmp["MaxDD"].apply(fmt_pct)
     st.dataframe(tmp, use_container_width=True)
 
-    # Best by Sharpe (tie-breaker by MaxDD)
-    raw = sweep_df.copy()
-    raw["MaxDD_abs"] = raw["MaxDD"].abs()
-    best = raw.sort_values(by=["Sharpe", "MaxDD_abs"], ascending=[False, True]).iloc[0]
-    st.info(f"✅ Meilleur (dans ce mini-test) : **{best['Poids bot']}** — Sharpe {best['Sharpe']:.2f}, MaxDD {best['MaxDD']*100:.2f}%.")
-
 with tab3:
-    st.subheader("Diagnostic Bot (satellite)")
+    st.subheader("Diagnostic satellite")
     diag = out["diagnostic"]
     x1, x2, x3, x4 = st.columns(4)
     x1.metric("% Risk-on", f"{diag['pct_risk_on']*100:.1f}%")
@@ -639,7 +679,7 @@ with tab3:
     x3.metric("Turnover moyen", f"{diag['avg_turnover']:.2f}")
     x4.metric("Somme frais (approx)", fmt_pct(diag["sum_fees"]))
 
-    st.subheader("Dernier signal bot")
+    st.subheader("Dernier signal")
     last_t = out["weights"].index[-1]
     is_on = bool(out["risk_on"].loc[last_t])
 
@@ -658,45 +698,37 @@ with tab3:
             st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
 
 with tab4:
-    st.subheader("Message automatique (copier/coller)")
-    last_t = out["weights"].index[-1]
-    last_date = last_t.strftime("%Y-%m-%d")
-    is_on = bool(out["risk_on"].loc[last_t])
+    st.subheader("Sauvegarde run (audit local)")
+    st.write("Clique pour sauvegarder config + stats + weights + equity dans `runs/` (créé automatiquement).")
 
-    alloc = out["weights"].loc[last_t]
-    alloc = alloc[alloc > 0].sort_values(ascending=False)
-
-    if cfg.momentum_mode == "DUAL":
-        mom_desc = f"Dual {cfg.lb_dual[0]}+{cfg.lb_dual[1]} (w={cfg.w_dual[0]:.2f}/{cfg.w_dual[1]:.2f})"
-    else:
-        mom_desc = f"Single {cfg.lb_single}"
-
-    filt_desc = "Filtre OFF" if not cfg.market_filter_on else f"Filtre ON ({cfg.market_filter_asset} > MA{cfg.market_filter_window_days}j)"
-
-    if not is_on:
-        pos_line = "Risk-off: CASH (0% exposé)"
-    else:
-        if alloc.empty:
-            pos_line = "Allocation: CASH (aucun score)"
-        else:
-            parts = [f"{t}: {int(round(w*100))}%" for t, w in alloc.items()]
-            pos_line = "Allocation: " + ", ".join(parts)
-
-    msg = "\n".join(
-        [
-            f"📌 Signal bot — {last_date}",
-            f"- Rebal: {'mensuel' if cfg.rebalance == 'M' else 'hebdo'} | Frais: {cfg.fee_bps:.1f} bps",
-            f"- Momentum: {mom_desc} | Top {cfg.top_n} | Long-only: {'OUI' if cfg.long_only else 'NON'}",
-            f"- {filt_desc} | Risk-on: {'OUI' if is_on else 'NON'}",
-            f"- {pos_line}",
-            "",
-            f"🧩 Combo: {int(out['core_weight']*100)}% Core ({core_ticker}) / {int(out['sat_weight']*100)}% Bot",
-            f"📈 Bot (net): CAGR {perf_bot['CAGR']*100:.2f}% | MaxDD {perf_bot['MaxDD']*100:.2f}% | Sharpe {perf_bot['Sharpe']:.2f}",
-            f"📊 Core ({core_ticker}): CAGR {perf_core['CAGR']*100:.2f}% | MaxDD {perf_core['MaxDD']*100:.2f}% | Sharpe {perf_core['Sharpe']:.2f}",
-            f"✅ Combo: CAGR {perf_combo['CAGR']*100:.2f}% | MaxDD {perf_combo['MaxDD']*100:.2f}% | Sharpe {perf_combo['Sharpe']:.2f}",
-        ]
-    )
-    st.text_area("Message", value=msg, height=280)
+    if st.button("💾 Sauvegarder ce run"):
+        try:
+            run_dir = new_run_dir(prefix="local")
+            config_dump = {
+                "strategy": asdict(strat_cfg),
+                "backtest": {"fee_bps": bt_cfg.fee_bps},
+                "universe": universe,
+                "core_ticker": core_ticker,
+                "sat_weight": sat_weight,
+                "date_range": {"start": str(start_d), "end": str(end_d)},
+            }
+            stats_dump = {
+                "bot": perf_bot,
+                "core": perf_core,
+                "combo": perf_combo,
+                "diagnostic": out["diagnostic"],
+            }
+            save_run(
+                run_dir=run_dir,
+                config=config_dump,
+                stats=stats_dump,
+                weights=out["weights"],
+                equity=out["equity_df"],
+                risk_on=out["risk_on"],
+            )
+            st.success(f"Run sauvegardé: {run_dir.as_posix()}")
+        except Exception as e:
+            st.error(f"Erreur sauvegarde run : {e}")
 
 st.divider()
 st.caption("⚠️ Backtest simplifié (pas un conseil financier). Taxes/slippage/exécution non inclus.")
