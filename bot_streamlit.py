@@ -1,6 +1,8 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
-# Core/Satellite Backtester (Streamlit) — SINGLE FILE + MULTI-USER AUTH
+# Core/Satellite Backtester (Streamlit) — SINGLE FILE + MULTI-USER AUTH (SAFE QUOTES)
+#
+# Features:
 # - Upload CSV: wide (Date + tickers) OR many CSVs (1 per ticker)
 # - Satellite: Momentum (SINGLE / DUAL) + crash filter (asset MA window days) + Risk-off CASH
 # - Fees: bps * turnover, turnover = 0.5 * sum(|Δw|)
@@ -9,15 +11,18 @@
 # - Weight sweep: 10/20/30/50 + current
 #
 # Security:
-# - 1A: If no credentials configured -> app blocked
-# - 2B: Multi-user auth via st.secrets["USERS"] (hashed passwords)
-#       Fallback: st.secrets["APP_PASSWORD"] (single password)
-# - 3B: Runs/audit saving disabled by default on cloud (can enable locally)
+# - If no credentials configured -> access blocked (recommended for public)
+# - Multi-user auth via Streamlit Secrets "USERS" (JSON dict with hashed passwords)
+# - Fallback single password via "APP_PASSWORD"
+#
+# Runs (audit):
+# - 3B: saving is disabled in cloud by default
+# - You can enable locally by setting env ENABLE_RUN_SAVE=1
 #
 # Requirements:
 #   pip install streamlit pandas numpy
 #
-# Run:
+# Run locally:
 #   streamlit run bot_streamlit.py
 # ------------------------------------------------------------
 
@@ -48,19 +53,16 @@ st.set_page_config(page_title="Core/Satellite Bot (CSV)", page_icon="📈", layo
 # Security / Auth
 # -----------------------------
 BLOCK_IF_NO_CREDENTIALS = True  # 1A
-
-# 3B: disable saving runs in cloud; allow enabling locally via env
-# - default: OFF everywhere
-# - to enable locally: set ENABLE_RUN_SAVE=1 before running
-ENABLE_RUN_SAVE = os.getenv("ENABLE_RUN_SAVE", "0").strip() == "1"
+ENABLE_RUN_SAVE = os.getenv("ENABLE_RUN_SAVE", "0").strip() == "1"  # 3B default OFF
 
 
 def _load_users_from_secrets() -> Optional[Dict[str, str]]:
     """
     Reads USERS from Streamlit secrets.
-    Expected format:
-      USERS = """{ "alice":"pbkdf2_sha256$200000$salt$hash", ... }"""
-      
+    Expected in Streamlit Secrets (Settings -> Secrets):
+      USERS = '{ "alice":"pbkdf2_sha256$200000$salt_hex$hash_hex" }'
+    """
+    raw = None
     try:
         raw = st.secrets.get("USERS", None)
     except Exception:
@@ -70,11 +72,10 @@ def _load_users_from_secrets() -> Optional[Dict[str, str]]:
         return None
 
     try:
+        if isinstance(raw, dict):
+            return dict(raw)
         if isinstance(raw, str):
             return json.loads(raw)
-        if isinstance(raw, dict):
-            # Streamlit might already parse it
-            return dict(raw)
     except Exception:
         return None
 
@@ -100,14 +101,13 @@ def _verify_pbkdf2_sha256(stored: str, password: str) -> bool:
 
 def _require_auth() -> None:
     """
-    Multi-user auth (2B):
-      - If USERS present: username + password, verify hashed.
-      - Else fallback APP_PASSWORD (single password).
-    1A behavior: if no credentials configured -> block.
+    Auth logic:
+    - If USERS exists in secrets -> username+password checked against hashed entries.
+    - Else fallback to APP_PASSWORD (single shared password).
+    - If neither exists -> block if BLOCK_IF_NO_CREDENTIALS True.
     """
     users = _load_users_from_secrets()
 
-    # Fallback single password
     app_password = None
     try:
         if "APP_PASSWORD" in st.secrets:
@@ -117,9 +117,8 @@ def _require_auth() -> None:
     if not app_password:
         app_password = os.getenv("APP_PASSWORD")
 
-    has_any_credentials = bool(users) or bool(app_password)
-
-    if not has_any_credentials:
+    has_any = bool(users) or bool(app_password)
+    if not has_any:
         if BLOCK_IF_NO_CREDENTIALS:
             st.warning("🔐 Aucun identifiant configuré (USERS ou APP_PASSWORD). Accès bloqué.")
             st.stop()
@@ -134,11 +133,9 @@ def _require_auth() -> None:
 
     st.sidebar.header("🔐 Connexion")
 
-    # Multi-user mode if USERS exists
     if users:
         username = st.sidebar.text_input("Utilisateur")
         pwd = st.sidebar.text_input("Mot de passe", type="password")
-
         if not username or not pwd:
             st.stop()
 
@@ -151,7 +148,6 @@ def _require_auth() -> None:
             st.sidebar.error("Identifiants incorrects.")
             st.stop()
 
-    # Else single password mode
     else:
         pwd = st.sidebar.text_input("Mot de passe", type="password")
         if not pwd:
@@ -170,10 +166,10 @@ _require_auth()
 
 
 # -----------------------------
-# App header
+# Header
 # -----------------------------
 st.title("📈 Core/Satellite — Bot Momentum (CSV)")
-st.caption("Single-file • CSV upload • Filtre crash (MA) • Frais • Core/Satellite • Auth multi-user • Runs audités")
+st.caption("Single-file • CSV upload • Filtre crash (MA) • Frais • Core/Satellite • Auth multi-user")
 
 
 # -----------------------------
@@ -269,9 +265,9 @@ def infer_ticker_from_filename(filename: str) -> str:
 
 
 def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    frames = []
-    tickers = []
-    problems = []
+    frames: List[pd.DataFrame] = []
+    tickers: List[str] = []
+    problems: List[str] = []
 
     for f in files:
         fname = getattr(f, "name", "fichier")
@@ -312,7 +308,7 @@ def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
 
 
 # -----------------------------
-# Math / metrics
+# Metrics
 # -----------------------------
 def resample_prices(close: pd.DataFrame, rebalance: str) -> pd.DataFrame:
     if rebalance == "M":
@@ -383,7 +379,11 @@ def compute_risk_on_daily(close_daily: pd.DataFrame, rebal_index: pd.DatetimeInd
     return sig_rebal
 
 
-def build_weights(prices_rebal: pd.DataFrame, risk_on: pd.Series, cfg: StrategyConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def build_weights(
+    prices_rebal: pd.DataFrame,
+    risk_on: pd.Series,
+    cfg: StrategyConfig
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     scores = compute_scores(prices_rebal, cfg)
     risk_on = risk_on.reindex(prices_rebal.index).fillna(False).astype(bool)
 
@@ -425,17 +425,55 @@ def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestCon
     ret_gross = (w_prev * r).sum(axis=1).fillna(0.0)
     ret_net = (ret_gross - fees).fillna(0.0)
 
-    eq_gross = (1.0 + ret_gross).cumprod()
     eq_net = (1.0 + ret_net).cumprod()
 
     return {
         "turnover": turnover,
         "fees": fees,
-        "ret_gross": ret_gross,
         "ret_net": ret_net,
-        "eq_gross": eq_gross,
         "eq_net": eq_net,
     }
+
+
+# -----------------------------
+# Runs / audit saving (optional local)
+# -----------------------------
+def get_runs_dir() -> Path:
+    root = os.getenv("RUNS_DIR", "runs")
+    p = Path(root)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def new_run_dir(prefix: str = "local") -> Path:
+    runs = get_runs_dir()
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = runs / f"{stamp}_{prefix}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(x) for x in obj]
+    try:
+        return asdict(obj)
+    except Exception:
+        return str(obj)
+
+
+def save_run(run_dir: Path, config: Dict[str, Any], stats: Dict[str, Any],
+             weights: pd.DataFrame, equity: pd.DataFrame, risk_on: Optional[pd.Series]) -> None:
+    (run_dir / "config.json").write_text(json.dumps(_to_jsonable(config), indent=2), encoding="utf-8")
+    (run_dir / "stats.json").write_text(json.dumps(_to_jsonable(stats), indent=2), encoding="utf-8")
+    weights.to_csv(run_dir / "weights.csv", index=True)
+    equity.to_csv(run_dir / "equity.csv", index=True)
+    if risk_on is not None:
+        risk_on.rename("risk_on").to_csv(run_dir / "risk_on.csv", index=True)
 
 
 # -----------------------------
@@ -500,10 +538,6 @@ def run_combo(
         "scores": scores,
         "risk_on": risk_on_aligned,
         "bt": bt,
-        "core_eq": core_eq,
-        "core_ret": core_ret_aligned,
-        "combo_eq": combo_eq,
-        "combo_ret": combo_ret,
         "perf_bot": perf_bot,
         "perf_core": perf_core,
         "perf_combo": perf_combo,
@@ -539,7 +573,7 @@ try:
         if not uploaded_many:
             st.info("➡️ Upload plusieurs CSV (un par ticker) pour démarrer.")
             st.stop()
-        close, tickers_loaded, problems = load_many_csv(uploaded_many)
+        close, _tickers_loaded, problems = load_many_csv(uploaded_many)
 except Exception as e:
     st.error(f"Erreur chargement CSV : {e}")
     st.stop()
@@ -599,7 +633,7 @@ with st.sidebar:
 
     st.divider()
     st.header("4) Univers satellite")
-    default_univ = [t for t in DEFAULT_UNIVERSE if t in available]
+    default_univ = [t for t in ["SPY", "QQQ", "TLT", "GLD", "IEF", "EFA", "EEM", "VNQ"] if t in available]
     if len(default_univ) < 2:
         default_univ = available[: min(8, len(available))]
     universe = st.multiselect("Univers (satellite)", options=available, default=default_univ)
@@ -626,6 +660,7 @@ with st.sidebar:
     end_d = st.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
 
 
+# Data range + needed cols
 close = close.loc[(close.index >= pd.to_datetime(str(start_d))) & (close.index <= pd.to_datetime(str(end_d)))].copy()
 if close.empty:
     st.error("Aucune donnée dans la plage choisie.")
@@ -634,12 +669,13 @@ if close.empty:
 needed_cols = sorted(set(universe + [market_filter_asset, core_ticker]))
 close = close[needed_cols].copy()
 
+# Build configs
 strat_cfg = StrategyConfig(
     rebalance=str(rebalance),
     top_n=int(min(top_n, len(universe))),
     long_only=bool(long_only),
     momentum_mode=str(momentum_mode),
-    lb_single=int(12 if momentum_mode == "DUAL" else lb_single),
+    lb_single=int(lb_single),
     lb_dual=(int(lb1), int(lb2)),
     w_dual=(float(w1), float(w2)),
     market_filter_on=bool(market_filter_on),
@@ -649,26 +685,20 @@ strat_cfg = StrategyConfig(
 )
 bt_cfg = BacktestConfig(fee_bps=float(fee_bps))
 
+# Run
 try:
-    out = run_combo(
-        close_daily=close,
-        universe=universe,
-        core_ticker=core_ticker,
-        sat_weight=sat_weight,
-        strat_cfg=strat_cfg,
-        bt_cfg=bt_cfg,
-    )
+    out = run_combo(close, universe, core_ticker, sat_weight, strat_cfg, bt_cfg)
 except Exception as e:
     st.error(f"Erreur backtest : {e}")
     st.stop()
 
-
+# Weight sweep
 def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
     rows = []
     for w in sorted(set(weights_list)):
         o = run_combo(close, universe, core_ticker, w, strat_cfg, bt_cfg)
         rows.append({
-            "Poids bot": f"{int(round(w*100))}%",
+            "Poids bot": f"{int(round(w * 100))}%",
             "CAGR": o["perf_combo"]["CAGR"],
             "Sharpe": o["perf_combo"]["Sharpe"],
             "MaxDD": o["perf_combo"]["MaxDD"],
@@ -676,10 +706,9 @@ def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-
 sweep_df = weight_sweep([0.10, 0.20, 0.30, 0.50, float(sat_weight)])
 
-
+# Tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Résumé", "🧪 Tests poids", "🔍 Diagnostic", "🧾 Runs (audit)"])
 
 perf_bot = out["perf_bot"]
@@ -703,19 +732,13 @@ with tab1:
     d4.metric("Max DD", fmt_pct(perf_core["MaxDD"]))
     d5.metric("Calmar", fmt_num(perf_core["Calmar"]))
 
-    st.subheader(f"Portefeuille combiné — {int(out['core_weight']*100)}% Core / {int(out['sat_weight']*100)}% Bot")
+    st.subheader(f"Portefeuille combiné — {int(out['core_weight'] * 100)}% Core / {int(out['sat_weight'] * 100)}% Bot")
     e1, e2, e3, e4, e5 = st.columns(5)
     e1.metric("CAGR (combo)", fmt_pct(perf_combo["CAGR"]))
     e2.metric("Vol (ann.)", fmt_pct(perf_combo["Vol"]))
     e3.metric("Sharpe", fmt_num(perf_combo["Sharpe"]))
     e4.metric("Max DD", fmt_pct(perf_combo["MaxDD"]))
     e5.metric("Calmar", fmt_num(perf_combo["Calmar"]))
-
-    st.caption(
-        f"Rebal={strat_cfg.rebalance} | Top {strat_cfg.top_n} | Frais={bt_cfg.fee_bps:.1f} bps | "
-        f"Filtre={'ON' if strat_cfg.market_filter_on else 'OFF'} ({strat_cfg.market_filter_asset}, MA{strat_cfg.market_filter_window_days}j) | "
-        f"Risk-off={strat_cfg.risk_off_mode} | Momentum={strat_cfg.momentum_mode}"
-    )
 
     st.subheader("Courbes de capital (net)")
     st.line_chart(out["equity_df"])
@@ -738,39 +761,18 @@ with tab3:
     st.subheader("Diagnostic satellite")
     diag = out["diagnostic"]
     x1, x2, x3, x4 = st.columns(4)
-    x1.metric("% Risk-on", f"{diag['pct_risk_on']*100:.1f}%")
+    x1.metric("% Risk-on", f"{diag['pct_risk_on'] * 100:.1f}%")
     x2.metric("Transitions on/off", str(diag["transitions"]))
     x3.metric("Turnover moyen", f"{diag['avg_turnover']:.2f}")
     x4.metric("Somme frais (approx)", fmt_pct(diag["sum_fees"]))
 
-    st.subheader("Dernier signal")
-    last_t = out["weights"].index[-1]
-    is_on = bool(out["risk_on"].loc[last_t])
-
-    colL, colR = st.columns(2)
-    with colL:
-        st.markdown("**Scores momentum (dernier)**")
-        last_scores = out["scores"].loc[last_t].dropna().sort_values(ascending=False)
-        st.dataframe(last_scores.to_frame("Score").style.format("{:.2%}"), use_container_width=True)
-    with colR:
-        st.markdown("**Allocation cible (dernier)**")
-        last_alloc = out["weights"].loc[last_t]
-        last_alloc = last_alloc[last_alloc > 0].sort_values(ascending=False)
-        if (not is_on) or last_alloc.empty:
-            st.info("CASH (risk-off ou aucun signal).")
-        else:
-            st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
-
 with tab4:
     st.subheader("Runs (audit)")
     st.write("3B: la sauvegarde serveur est désactivée par défaut (plus sûr en public).")
-
     if ENABLE_RUN_SAVE:
-        st.info("Sauvegarde activée (ENABLE_RUN_SAVE=1).")
-        # (Tu peux remettre ici save_run si tu veux en local. On l’a volontairement retiré pour 3B.)
+        st.info("Sauvegarde activée (ENABLE_RUN_SAVE=1). (Local recommandé)")
     else:
         st.warning("Sauvegarde désactivée. Pour l'activer en local: définir ENABLE_RUN_SAVE=1.")
 
 st.divider()
 st.caption("⚠️ Backtest simplifié (pas un conseil financier). Taxes/slippage/exécution non inclus.")
-
