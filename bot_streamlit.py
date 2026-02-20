@@ -20,7 +20,41 @@ from __future__ import annotations
 
 import os
 import json
-import math
+import mathimport os
+import hmac
+import streamlit as st
+
+def require_password():
+    expected = None
+    if "APP_PASSWORD" in st.secrets:
+        expected = st.secrets["APP_PASSWORD"]
+    else:
+        expected = os.getenv("APP_PASSWORD")
+
+    if not expected:
+        st.warning("Mot de passe non configuré.")
+        st.stop()
+
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+
+    if st.session_state.auth_ok:
+        return
+
+    st.sidebar.header("🔐 Accès privé")
+    pwd = st.sidebar.text_input("Mot de passe", type="password")
+
+    if pwd and hmac.compare_digest(pwd, str(expected)):
+        st.session_state.auth_ok = True
+        st.rerun()
+    elif pwd:
+        st.sidebar.error("Mot de passe incorrect.")
+        st.stop()
+    else:
+        st.stop()
+
+require_password()
+
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -732,3 +766,4 @@ with tab4:
 
 st.divider()
 st.caption("⚠️ Backtest simplifié (pas un conseil financier). Taxes/slippage/exécution non inclus.")
+
