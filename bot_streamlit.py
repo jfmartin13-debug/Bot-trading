@@ -1,6 +1,6 @@
 # bot_streamlit.py
 # ------------------------------------------------------------
-# Core/Satellite Backtester (Streamlit) — SINGLE FILE + MULTI-USER AUTH (SAFE QUOTES)
+# Core/Satellite Backtester (Streamlit) — SINGLE FILE + AUTH (multi-user) + SAFE compare_digest
 #
 # Features:
 # - Upload CSV: wide (Date + tickers) OR many CSVs (1 per ticker)
@@ -11,13 +11,14 @@
 # - Weight sweep: 10/20/30/50 + current
 #
 # Security:
-# - If no credentials configured -> access blocked (recommended for public)
-# - Multi-user auth via Streamlit Secrets "USERS" (JSON dict with hashed passwords)
-# - Fallback single password via "APP_PASSWORD"
+# - If no credentials configured -> access blocked (recommended)
+# - Multi-user auth via Streamlit Secrets USERS (JSON dict: username -> hash string)
+# - Fallback single password via APP_PASSWORD
+# - compare_digest uses bytes to avoid TypeError on Streamlit Cloud
 #
 # Runs (audit):
-# - 3B: saving is disabled in cloud by default
-# - You can enable locally by setting env ENABLE_RUN_SAVE=1
+# - 3B: saving is disabled by default (safer for public cloud).
+# - Enable locally: set env ENABLE_RUN_SAVE=1
 #
 # Requirements:
 #   pip install streamlit pandas numpy
@@ -49,9 +50,10 @@ import streamlit as st
 st.set_page_config(page_title="Core/Satellite Bot (CSV)", page_icon="📈", layout="wide")
 
 
-# -----------------------------
-# Security / Auth
-# -----------------------------
+# ============================================================
+# AUTH / SECURITY
+# ============================================================
+
 BLOCK_IF_NO_CREDENTIALS = True  # 1A
 ENABLE_RUN_SAVE = os.getenv("ENABLE_RUN_SAVE", "0").strip() == "1"  # 3B default OFF
 
@@ -59,8 +61,11 @@ ENABLE_RUN_SAVE = os.getenv("ENABLE_RUN_SAVE", "0").strip() == "1"  # 3B default
 def _load_users_from_secrets() -> Optional[Dict[str, str]]:
     """
     Reads USERS from Streamlit secrets.
-    Expected in Streamlit Secrets (Settings -> Secrets):
-      USERS = '{ "alice":"pbkdf2_sha256$200000$salt_hex$hash_hex" }'
+
+    In Streamlit Cloud -> Manage app -> Secrets, set for example:
+      USERS = '{ "admin":"pbkdf2_sha256$200000$salt_hex$hash_hex" }'
+
+    (USERS must be a JSON object in a string, or a dict if Streamlit parses it.)
     """
     raw = None
     try:
@@ -82,6 +87,25 @@ def _load_users_from_secrets() -> Optional[Dict[str, str]]:
     return None
 
 
+def _get_app_password_from_secrets_or_env() -> Optional[str]:
+    """
+    Fallback single-password mode.
+    In Streamlit Cloud -> Secrets:
+      APP_PASSWORD = "yourpassword"
+    """
+    app_password = None
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            app_password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        app_password = None
+
+    if not app_password:
+        app_password = os.getenv("APP_PASSWORD")
+
+    return str(app_password) if app_password else None
+
+
 def _verify_pbkdf2_sha256(stored: str, password: str) -> bool:
     """
     stored format: pbkdf2_sha256$iters$salt_hex$hash_hex
@@ -99,26 +123,24 @@ def _verify_pbkdf2_sha256(stored: str, password: str) -> bool:
         return False
 
 
+def _compare_str_bytes(a: str, b: str) -> bool:
+    """
+    Safe constant-time compare on bytes (avoids Streamlit Cloud SecretValue weirdness).
+    """
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 def _require_auth() -> None:
     """
     Auth logic:
-    - If USERS exists in secrets -> username+password checked against hashed entries.
-    - Else fallback to APP_PASSWORD (single shared password).
+    - If USERS exists -> username+password checked against hashed entries.
+    - Else fallback APP_PASSWORD (single shared password).
     - If neither exists -> block if BLOCK_IF_NO_CREDENTIALS True.
     """
     users = _load_users_from_secrets()
+    app_password = _get_app_password_from_secrets_or_env()
 
-    app_password = None
-    try:
-        if "APP_PASSWORD" in st.secrets:
-            app_password = st.secrets["APP_PASSWORD"]
-    except Exception:
-        app_password = None
-    if not app_password:
-        app_password = os.getenv("APP_PASSWORD")
-
-    has_any = bool(users) or bool(app_password)
-    if not has_any:
+    if not users and not app_password:
         if BLOCK_IF_NO_CREDENTIALS:
             st.warning("🔐 Aucun identifiant configuré (USERS ou APP_PASSWORD). Accès bloqué.")
             st.stop()
@@ -133,6 +155,7 @@ def _require_auth() -> None:
 
     st.sidebar.header("🔐 Connexion")
 
+    # Multi-user
     if users:
         username = st.sidebar.text_input("Utilisateur")
         pwd = st.sidebar.text_input("Mot de passe", type="password")
@@ -148,12 +171,16 @@ def _require_auth() -> None:
             st.sidebar.error("Identifiants incorrects.")
             st.stop()
 
+    # Fallback single password
     else:
         pwd = st.sidebar.text_input("Mot de passe", type="password")
         if not pwd:
             st.stop()
 
-        if hmac.compare_digest(str(pwd), str(app_password)):
+        expected = str(app_password)
+
+        # ✅ FIX: compare en bytes (évite TypeError)
+        if _compare_str_bytes(pwd, expected):
             st.session_state.auth_ok = True
             st.session_state.auth_user = "shared"
             st.rerun()
@@ -165,16 +192,16 @@ def _require_auth() -> None:
 _require_auth()
 
 
-# -----------------------------
-# Header
-# -----------------------------
+# ============================================================
+# UI HEADER
+# ============================================================
 st.title("📈 Core/Satellite — Bot Momentum (CSV)")
-st.caption("Single-file • CSV upload • Filtre crash (MA) • Frais • Core/Satellite • Auth multi-user")
+st.caption("Single-file • CSV upload • Filtre crash (MA) • Frais • Core/Satellite • Auth multi-user • 3B safe")
 
 
-# -----------------------------
-# Defaults
-# -----------------------------
+# ============================================================
+# DEFAULTS / CONSTANTS
+# ============================================================
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "EFA", "EEM", "VNQ", "TLT", "IEF", "GLD"]
 DEFAULT_CORE = "SPY"
 
@@ -184,9 +211,9 @@ PRICE_COL_CANDIDATES = [
 ]
 
 
-# -----------------------------
-# Config dataclasses
-# -----------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 @dataclass(frozen=True)
 class StrategyConfig:
     rebalance: str                      # "M" or "W"
@@ -210,9 +237,9 @@ class BacktestConfig:
     fee_bps: float
 
 
-# -----------------------------
-# Formatting
-# -----------------------------
+# ============================================================
+# FORMATTING
+# ============================================================
 def fmt_pct(x: float) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
@@ -225,9 +252,9 @@ def fmt_num(x: float) -> str:
     return f"{x:.2f}"
 
 
-# -----------------------------
-# CSV helpers
-# -----------------------------
+# ============================================================
+# CSV HELPERS
+# ============================================================
 def _detect_date_col(df: pd.DataFrame) -> str:
     if "Date" in df.columns:
         return "Date"
@@ -307,9 +334,9 @@ def load_many_csv(files) -> Tuple[pd.DataFrame, List[str], List[str]]:
     return merged, tickers, problems
 
 
-# -----------------------------
-# Metrics
-# -----------------------------
+# ============================================================
+# METRICS / MATH
+# ============================================================
 def resample_prices(close: pd.DataFrame, rebalance: str) -> pd.DataFrame:
     if rebalance == "M":
         return close.resample("M").last()
@@ -350,9 +377,9 @@ def summarize(eq: pd.Series, ret: pd.Series, ppy: float) -> Dict[str, float]:
     return {"CAGR": float(cagr), "Vol": vol, "Sharpe": float(sharpe), "MaxDD": float(mdd), "Calmar": float(calmar)}
 
 
-# -----------------------------
-# Strategy
-# -----------------------------
+# ============================================================
+# STRATEGY
+# ============================================================
 def compute_scores(prices_rebal: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     if cfg.momentum_mode == "SINGLE":
         return prices_rebal.pct_change(cfg.lb_single)
@@ -364,11 +391,15 @@ def compute_scores(prices_rebal: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFr
 
 
 def compute_risk_on_daily(close_daily: pd.DataFrame, rebal_index: pd.DatetimeIndex, cfg: StrategyConfig) -> pd.Series:
+    """
+    Crash filter computed on DAILY data (MA in days), then aligned on rebal dates by ffill.
+    """
     if not cfg.market_filter_on:
         return pd.Series(True, index=rebal_index)
 
     a = cfg.market_filter_asset
     if a not in close_daily.columns:
+        # If filter asset missing, treat as risk-on.
         return pd.Series(True, index=rebal_index)
 
     px = close_daily[a].dropna()
@@ -379,11 +410,7 @@ def compute_risk_on_daily(close_daily: pd.DataFrame, rebal_index: pd.DatetimeInd
     return sig_rebal
 
 
-def build_weights(
-    prices_rebal: pd.DataFrame,
-    risk_on: pd.Series,
-    cfg: StrategyConfig
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def build_weights(prices_rebal: pd.DataFrame, risk_on: pd.Series, cfg: StrategyConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     scores = compute_scores(prices_rebal, cfg)
     risk_on = risk_on.reindex(prices_rebal.index).fillna(False).astype(bool)
 
@@ -409,14 +436,17 @@ def build_weights(
     return w, scores, risk_on
 
 
-# -----------------------------
-# Backtest
-# -----------------------------
+# ============================================================
+# BACKTEST
+# ============================================================
 def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestConfig) -> Dict[str, pd.Series]:
     r = prices_rebal.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
     weights = weights.fillna(0.0)
 
+    # Apply previous weights (no look-ahead)
     w_prev = weights.shift(1).fillna(0.0)
+
+    # One-way turnover
     turnover = 0.5 * (weights - w_prev).abs().sum(axis=1)
 
     fee_rate = cfg.fee_bps / 10000.0
@@ -435,9 +465,9 @@ def backtest(prices_rebal: pd.DataFrame, weights: pd.DataFrame, cfg: BacktestCon
     }
 
 
-# -----------------------------
-# Runs / audit saving (optional local)
-# -----------------------------
+# ============================================================
+# RUNS SAVE (optional, local only)
+# ============================================================
 def get_runs_dir() -> Path:
     root = os.getenv("RUNS_DIR", "runs")
     p = Path(root)
@@ -476,9 +506,9 @@ def save_run(run_dir: Path, config: Dict[str, Any], stats: Dict[str, Any],
         risk_on.rename("risk_on").to_csv(run_dir / "risk_on.csv", index=True)
 
 
-# -----------------------------
-# Combo runner
-# -----------------------------
+# ============================================================
+# COMBO RUNNER
+# ============================================================
 def run_combo(
     close_daily: pd.DataFrame,
     universe: List[str],
@@ -495,23 +525,32 @@ def run_combo(
     if len(sat_cols) < 2:
         raise ValueError("Univers satellite : au moins 2 tickers requis (présents dans les données).")
 
+    # Risk-on signal (daily filter aligned to rebal dates)
     risk_on = compute_risk_on_daily(close_daily, prices_rebal.index, strat_cfg)
+
+    # Bot weights
     weights, scores, risk_on_aligned = build_weights(prices_rebal[sat_cols], risk_on=risk_on, cfg=strat_cfg)
+
+    # Satellite backtest
     bt = backtest(prices_rebal[weights.columns], weights, bt_cfg)
 
+    # Core buy&hold
     if core_ticker not in prices_rebal.columns:
         raise ValueError(f"Ticker core '{core_ticker}' introuvable dans les données.")
     core_px = prices_rebal[core_ticker].dropna()
     core_ret = core_px.pct_change().fillna(0.0)
     core_eq = (1.0 + core_ret).cumprod()
 
+    # Align returns
     bot_ret = bt["ret_net"].reindex(core_ret.index).fillna(0.0)
     core_ret_aligned = core_ret.reindex(bot_ret.index).fillna(0.0)
 
+    # Combo
     core_weight = 1.0 - float(sat_weight)
     combo_ret = core_weight * core_ret_aligned + float(sat_weight) * bot_ret
     combo_eq = (1.0 + combo_ret).cumprod()
 
+    # Stats
     ppy = periods_per_year(strat_cfg.rebalance)
     perf_bot = summarize(bt["eq_net"], bt["ret_net"], ppy)
     perf_core = summarize(core_eq.reindex(combo_eq.index).ffill(), core_ret_aligned, ppy)
@@ -538,6 +577,10 @@ def run_combo(
         "scores": scores,
         "risk_on": risk_on_aligned,
         "bt": bt,
+        "core_eq": core_eq,
+        "core_ret": core_ret_aligned,
+        "combo_eq": combo_eq,
+        "combo_ret": combo_ret,
         "perf_bot": perf_bot,
         "perf_core": perf_core,
         "perf_combo": perf_combo,
@@ -548,9 +591,9 @@ def run_combo(
     }
 
 
-# -----------------------------
-# Sidebar: Data
-# -----------------------------
+# ============================================================
+# SIDEBAR: DATA
+# ============================================================
 with st.sidebar:
     st.header("1) Données")
     upload_mode = st.radio("Mode d'upload", ["Un seul CSV (wide)", "Plusieurs CSV (un par ticker)"], index=1)
@@ -562,6 +605,7 @@ with st.sidebar:
     else:
         uploaded_many = st.file_uploader("Upload plusieurs CSV (1 par ticker)", type=["csv"], accept_multiple_files=True)
 
+# Load data
 try:
     if upload_mode == "Un seul CSV (wide)":
         if uploaded_one is None:
@@ -592,9 +636,9 @@ if problems:
 available = list(close.columns)
 
 
-# -----------------------------
-# Sidebar: Params
-# -----------------------------
+# ============================================================
+# SIDEBAR: PARAMS
+# ============================================================
 with st.sidebar:
     st.divider()
     st.header("2) Satellite (Bot)")
@@ -633,7 +677,7 @@ with st.sidebar:
 
     st.divider()
     st.header("4) Univers satellite")
-    default_univ = [t for t in ["SPY", "QQQ", "TLT", "GLD", "IEF", "EFA", "EEM", "VNQ"] if t in available]
+    default_univ = [t for t in DEFAULT_UNIVERSE if t in available]
     if len(default_univ) < 2:
         default_univ = available[: min(8, len(available))]
     universe = st.multiselect("Univers (satellite)", options=available, default=default_univ)
@@ -652,7 +696,7 @@ with st.sidebar:
     sat_weight_pct = st.slider("Poids satellite (%)", 0, 80, 50, 5)
     sat_weight = sat_weight_pct / 100.0
     core_weight = 1.0 - sat_weight
-    st.caption(f"Combo: {int(core_weight*100)}% Core / {int(sat_weight*100)}% Satellite")
+    st.caption(f"Combo: {int(core_weight * 100)}% Core / {int(sat_weight * 100)}% Satellite")
 
     st.divider()
     st.header("6) Dates")
@@ -660,12 +704,13 @@ with st.sidebar:
     end_d = st.date_input("Fin", value=pd.to_datetime(close.index.max()).date())
 
 
-# Data range + needed cols
+# Apply date range
 close = close.loc[(close.index >= pd.to_datetime(str(start_d))) & (close.index <= pd.to_datetime(str(end_d)))].copy()
 if close.empty:
     st.error("Aucune donnée dans la plage choisie.")
     st.stop()
 
+# Keep only required columns
 needed_cols = sorted(set(universe + [market_filter_asset, core_ticker]))
 close = close[needed_cols].copy()
 
@@ -685,12 +730,20 @@ strat_cfg = StrategyConfig(
 )
 bt_cfg = BacktestConfig(fee_bps=float(fee_bps))
 
-# Run
+# Run main
 try:
-    out = run_combo(close, universe, core_ticker, sat_weight, strat_cfg, bt_cfg)
+    out = run_combo(
+        close_daily=close,
+        universe=universe,
+        core_ticker=core_ticker,
+        sat_weight=sat_weight,
+        strat_cfg=strat_cfg,
+        bt_cfg=bt_cfg,
+    )
 except Exception as e:
     st.error(f"Erreur backtest : {e}")
     st.stop()
+
 
 # Weight sweep
 def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
@@ -708,7 +761,10 @@ def weight_sweep(weights_list: List[float]) -> pd.DataFrame:
 
 sweep_df = weight_sweep([0.10, 0.20, 0.30, 0.50, float(sat_weight)])
 
-# Tabs
+
+# ============================================================
+# TABS
+# ============================================================
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Résumé", "🧪 Tests poids", "🔍 Diagnostic", "🧾 Runs (audit)"])
 
 perf_bot = out["perf_bot"]
@@ -740,6 +796,12 @@ with tab1:
     e4.metric("Max DD", fmt_pct(perf_combo["MaxDD"]))
     e5.metric("Calmar", fmt_num(perf_combo["Calmar"]))
 
+    st.caption(
+        f"Rebal={strat_cfg.rebalance} | Top {strat_cfg.top_n} | Frais={bt_cfg.fee_bps:.1f} bps | "
+        f"Filtre={'ON' if strat_cfg.market_filter_on else 'OFF'} ({strat_cfg.market_filter_asset}, MA{strat_cfg.market_filter_window_days}j) | "
+        f"Risk-off={strat_cfg.risk_off_mode} | Momentum={strat_cfg.momentum_mode}"
+    )
+
     st.subheader("Courbes de capital (net)")
     st.line_chart(out["equity_df"])
 
@@ -766,11 +828,60 @@ with tab3:
     x3.metric("Turnover moyen", f"{diag['avg_turnover']:.2f}")
     x4.metric("Somme frais (approx)", fmt_pct(diag["sum_fees"]))
 
+    st.subheader("Dernier signal")
+    last_t = out["weights"].index[-1]
+    is_on = bool(out["risk_on"].loc[last_t])
+
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("**Scores momentum (dernier)**")
+        last_scores = out["scores"].loc[last_t].dropna().sort_values(ascending=False)
+        st.dataframe(last_scores.to_frame("Score").style.format("{:.2%}"), use_container_width=True)
+    with colR:
+        st.markdown("**Allocation cible (dernier)**")
+        last_alloc = out["weights"].loc[last_t]
+        last_alloc = last_alloc[last_alloc > 0].sort_values(ascending=False)
+        if (not is_on) or last_alloc.empty:
+            st.info("CASH (risk-off ou aucun signal).")
+        else:
+            st.dataframe(last_alloc.to_frame("Poids").style.format("{:.0%}"), use_container_width=True)
+
 with tab4:
     st.subheader("Runs (audit)")
     st.write("3B: la sauvegarde serveur est désactivée par défaut (plus sûr en public).")
+
     if ENABLE_RUN_SAVE:
-        st.info("Sauvegarde activée (ENABLE_RUN_SAVE=1). (Local recommandé)")
+        st.info("Sauvegarde activée (ENABLE_RUN_SAVE=1).")
+        st.write("👉 En cloud public, évite d'écrire des fichiers. En local, c’est OK.")
+        # (Optionnel: tu peux réactiver un bouton save local ici si tu veux)
+        if st.button("💾 Sauvegarder ce run (local)"):
+            try:
+                run_dir = new_run_dir(prefix="local")
+                config_dump = {
+                    "strategy": asdict(strat_cfg),
+                    "backtest": {"fee_bps": bt_cfg.fee_bps},
+                    "universe": universe,
+                    "core_ticker": core_ticker,
+                    "sat_weight": sat_weight,
+                    "date_range": {"start": str(start_d), "end": str(end_d)},
+                }
+                stats_dump = {
+                    "bot": perf_bot,
+                    "core": perf_core,
+                    "combo": perf_combo,
+                    "diagnostic": out["diagnostic"],
+                }
+                save_run(
+                    run_dir=run_dir,
+                    config=config_dump,
+                    stats=stats_dump,
+                    weights=out["weights"],
+                    equity=out["equity_df"],
+                    risk_on=out["risk_on"],
+                )
+                st.success(f"Run sauvegardé: {run_dir.as_posix()}")
+            except Exception as e:
+                st.error(f"Erreur sauvegarde run : {e}")
     else:
         st.warning("Sauvegarde désactivée. Pour l'activer en local: définir ENABLE_RUN_SAVE=1.")
 
