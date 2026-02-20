@@ -60,7 +60,7 @@ def _load_users_from_secrets() -> Optional[Dict[str, str]]:
     Reads USERS from Streamlit secrets.
     Expected format:
       USERS = """{ "alice":"pbkdf2_sha256$200000$salt$hash", ... }"""
-    """
+      
     try:
         raw = st.secrets.get("USERS", None)
     except Exception:
@@ -773,3 +773,4 @@ with tab4:
 
 st.divider()
 st.caption("⚠️ Backtest simplifié (pas un conseil financier). Taxes/slippage/exécution non inclus.")
+
