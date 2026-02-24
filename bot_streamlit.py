@@ -3,7 +3,7 @@
 # + PDF export, multi-strategy comparison, multi-horizon momentum, weekly/quarterly rebal, hashed passwords,
 # + core_weight optimization grid-search.
 #
-# Data source: Yahoo Finance (yfinance) by default with cache
+# Data source: Yahoo Finance (yfinance) by default with cache (ROBUST: bulk download + per-ticker fallback)
 # CSV option preserved: wide CSV + multi CSV upload
 # Auth: APP_PASSWORD (fallback plaintext) + option USERS multi-user (plaintext or PBKDF2-hash), compare_digest on bytes
 #
@@ -112,7 +112,7 @@ def pbkdf2_verify(password: str, stored: str) -> bool:
 
 
 def _check_password(input_pw: str, stored_pw_or_hash: str) -> bool:
-    # If looks like our PBKDF2 format, verify hash; else fallback to plaintext compare
+    # If looks like PBKDF2 format, verify hash; else fallback to plaintext compare
     if stored_pw_or_hash.startswith("pbkdf2$"):
         return pbkdf2_verify(input_pw, stored_pw_or_hash)
     return _secure_compare(input_pw, stored_pw_or_hash)
@@ -178,44 +178,82 @@ def _normalize_ticker_list(raw: str) -> List[str]:
 @st.cache_data(show_spinner=False, ttl=60 * 60)  # cache 1h
 def load_prices_yahoo(tickers: Tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """
-    Returns adjusted close prices for tickers + synthetic CASH.
+    Returns adjusted close prices for tickers (business days).
+    Robust: tries yf.download first, then falls back to per-ticker history.
+    Includes synthetic CASH (flat 1.0).
     """
-    tickers_list = list(tickers)
+    tickers_list = [str(t).strip().upper() for t in tickers if str(t).strip()]
     want_cash = CASH_SYMBOL in tickers_list
     yf_tickers = [t for t in tickers_list if t != CASH_SYMBOL]
 
+    def _finalize(prices: pd.DataFrame) -> pd.DataFrame:
+        if want_cash:
+            if prices.empty:
+                idx = pd.bdate_range(start=pd.to_datetime(start), end=pd.to_datetime(end))
+                prices = pd.DataFrame(index=idx)
+            prices[CASH_SYMBOL] = 1.0
+        prices = prices.sort_index()
+        prices.columns = [str(c).strip().upper() for c in prices.columns]
+        prices = prices.ffill().dropna(how="all")
+        return prices
+
+    prices = pd.DataFrame()
+
+    # 1) Bulk download (fast)
     if yf_tickers:
-        df = yf.download(
-            yf_tickers,
-            start=start,
-            end=end,
-            auto_adjust=False,
-            progress=False,
-            group_by="column",
-            threads=True,
+        try:
+            df = yf.download(
+                yf_tickers,
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    # group_by="column" => first level usually fields, second tickers
+                    if "Adj Close" in df.columns.get_level_values(0):
+                        prices = df["Adj Close"].copy()
+                    elif "Close" in df.columns.get_level_values(0):
+                        prices = df["Close"].copy()
+                else:
+                    # single ticker -> OHLCV columns
+                    col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+                    if col:
+                        prices = df[col].to_frame(name=yf_tickers[0])
+        except Exception:
+            prices = pd.DataFrame()
+
+    # 2) Fallback: per-ticker history (more robust)
+    if prices.empty and yf_tickers:
+        frames = []
+        for t in yf_tickers:
+            try:
+                h = yf.Ticker(t).history(start=start, end=end, interval="1d", auto_adjust=False)
+                if isinstance(h, pd.DataFrame) and not h.empty:
+                    col = "Adj Close" if "Adj Close" in h.columns else ("Close" if "Close" in h.columns else None)
+                    if col:
+                        s = pd.to_numeric(h[col], errors="coerce").rename(t)
+                        frames.append(s)
+            except Exception:
+                continue
+        if frames:
+            prices = pd.concat(frames, axis=1)
+
+    prices = _finalize(prices)
+
+    # If still empty, fail with clear message (instead of “tickers manquants”)
+    if prices.empty:
+        raise RuntimeError(
+            "yfinance a renvoyé 0 données (réponse vide). "
+            "Ca arrive parfois sur Streamlit Cloud (rate-limit / réseau). "
+            "Reboot l'app et réessaie, ou utilise la source CSV."
         )
 
-        if isinstance(df.columns, pd.MultiIndex):
-            if "Adj Close" in df.columns.get_level_values(0):
-                prices = df["Adj Close"].copy()
-            else:
-                prices = df["Close"].copy()
-        else:
-            # single ticker OHLCV
-            col = "Adj Close" if "Adj Close" in df.columns else "Close"
-            prices = df[col].to_frame(name=yf_tickers[0])
-
-        prices = prices.sort_index()
-    else:
-        prices = pd.DataFrame()
-
-    if want_cash:
-        if prices.empty:
-            idx = pd.bdate_range(start=pd.to_datetime(start), end=pd.to_datetime(end))
-            prices = pd.DataFrame(index=idx)
-        prices[CASH_SYMBOL] = 1.0
-
-    prices = prices.ffill().dropna(how="all")
     return prices
 
 
@@ -326,7 +364,6 @@ def _rebalance_dates(idx: pd.DatetimeIndex, mode: str) -> pd.DatetimeIndex:
     mode_u = (mode or "M").upper().strip()
 
     if mode_u.startswith("W"):
-        # Use Friday as standard; resample('W-FRI').last() yields last obs in that week up to Friday
         r = s.resample("W-FRI").last().dropna().index
         return pd.DatetimeIndex(r)
 
@@ -334,7 +371,6 @@ def _rebalance_dates(idx: pd.DatetimeIndex, mode: str) -> pd.DatetimeIndex:
         r = s.resample("Q").last().dropna().index
         return pd.DatetimeIndex(r)
 
-    # default monthly
     r = s.resample("M").last().dropna().index
     return pd.DatetimeIndex(r)
 
@@ -358,11 +394,9 @@ def _momentum_total_return(prices: pd.DataFrame, asof: pd.Timestamp, lookback_da
 
 
 def _momentum_score(prices: pd.DataFrame, asof: pd.Timestamp, tickers: Sequence[str], mcfg: MomentumConfig) -> pd.Series:
-    # Single horizon
     if not mcfg.horizons_days:
         return _momentum_total_return(prices, asof, mcfg.lookback_days, tickers)
 
-    # Multi-horizon weighted combination (normalized weights)
     days = list(mcfg.horizons_days)
     wts = list(mcfg.horizons_weights) if mcfg.horizons_weights else [1.0] * len(days)
     if len(wts) != len(days):
@@ -391,11 +425,6 @@ def _crash_filter_on(bench_prices: pd.Series, asof: pd.Timestamp, ma_days: int) 
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
 def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      equity_curve: columns [portfolio, benchmark]
-      weights_hist: weights on rebalance dates
-    """
     all_tickers = sorted(set(cfg.core_tickers + cfg.satellite_tickers + (cfg.benchmark_ticker, cfg.risk_off_ticker)))
     prices = align_and_clean_prices(prices, all_tickers)
 
@@ -413,18 +442,15 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
     for d in rdates:
         w = pd.Series(0.0, index=all_tickers, dtype=float)
 
-        # crash filter: if ON => full risk-off
         if _crash_filter_on(bench_series, d, int(cfg.crash_ma_days)):
             w[:] = 0.0
             w[cfg.risk_off_ticker] = 1.0
             weights.loc[d] = w
             continue
 
-        # core sleeve
         for t in cfg.core_tickers:
             w[t] += core_each
 
-        # satellite sleeve
         sats = list(cfg.satellite_tickers)
         if sats and sat_w > 0:
             scores = _momentum_score(prices, d, sats, cfg.momentum).sort_values(ascending=False)
@@ -435,7 +461,6 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
                 risk_off = cfg.risk_off_ticker
                 if risk_off not in prices.columns:
                     prices[risk_off] = 1.0
-                # dual compare uses same momentum scoring function (multi-horizon OK)
                 ref_score = _momentum_score(prices, d, [risk_off], cfg.momentum).iloc[0]
                 best_score = float(chosen_scores.iloc[0]) if len(chosen_scores) else -np.inf
                 if (best_score <= ref_score) or (best_score <= 0):
@@ -445,7 +470,6 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
                     for t in chosen:
                         w[t] += each
             else:
-                # SINGLE: pick top K; if all negative => risk-off
                 if float(chosen_scores.max()) <= 0:
                     w[cfg.risk_off_ticker] += sat_w
                 else:
@@ -453,7 +477,6 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
                     for t in chosen:
                         w[t] += each
         else:
-            # no satellites => keep invested in risk-off with remainder
             rem = 1.0 - float(w.sum())
             if rem > 1e-12:
                 w[cfg.risk_off_ticker] += rem
@@ -466,7 +489,6 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
 
         weights.loc[d] = w
 
-    # simulate
     port = pd.Series(index=idx, dtype=float)
     bench = (1.0 + rets[cfg.benchmark_ticker]).cumprod()
     port.iloc[0] = 1.0
@@ -488,7 +510,6 @@ def backtest(prices: pd.DataFrame, cfg: StrategyConfig) -> Tuple[pd.DataFrame, p
         pr = float((current_w * r).sum())
         port.loc[d] = port.loc[prev] * (1.0 + pr)
 
-        # drift weights
         growth = (1.0 + r).replace([np.inf, -np.inf], 1.0).clip(lower=0.0)
         w_g = current_w * growth
         s = float(w_g.sum())
@@ -520,7 +541,6 @@ def plot_equity_multi(equities: Dict[str, pd.DataFrame], logy: bool = True) -> p
     for name, eq in equities.items():
         eq = eq.dropna()
         ax.plot(eq.index, eq["portfolio"], label=name)
-    # Benchmark from first
     if equities:
         any_eq = next(iter(equities.values()))
         ax.plot(any_eq.index, any_eq["benchmark"], label="Benchmark", linestyle="--")
@@ -562,9 +582,6 @@ def build_pdf_report(
     equity_png: Optional[bytes] = None,
     dd_png: Optional[bytes] = None,
 ) -> bytes:
-    """
-    Simple one-page (or two) PDF using reportlab, returned as bytes.
-    """
     buf = io.BytesIO()
     c = pdf_canvas.Canvas(buf, pagesize=letter)
     width, height = letter
@@ -589,7 +606,6 @@ def build_pdf_report(
         if not png_bytes:
             return y_top
         img_buf = io.BytesIO(png_bytes)
-        # fixed width
         img_w = width - 96
         img_h = img_w * 0.55
         y_top -= 14
@@ -674,7 +690,7 @@ with st.sidebar:
 
     st.markdown("## Univers")
     core_tickers_raw = st.text_area("Core tickers (virgules)", value="SPY")
-    sat_tickers_raw = st.text_area("Satellite tickers (virgules)", value="QQQ, IWM, EFA, EEM, GLD")
+    sat_tickers_raw = st.text_area("Satellite tickers (virgules)", value="QQQ, IWM, EFA, EEM, GLD, TLT")
     benchmark_ticker = st.text_input("Benchmark (crash + chart)", value="SPY").strip().upper()
     risk_off_ticker = st.text_input("Risk-off ticker (CASH recommandé)", value="CASH").strip().upper()
 
@@ -733,9 +749,9 @@ def build_momentum_ui(prefix: str) -> MomentumConfig:
         if lookback_mode == "Custom":
             lb = st.number_input(f"{prefix} Lookback (jours)", min_value=5, max_value=2000, value=126, step=5, key=f"{prefix}_lb")
             return MomentumConfig(mode=mode, lookback_days=int(lb), horizons_days=(), horizons_weights=())
+        # sweep marker
         return MomentumConfig(mode=mode, lookback_days=0, horizons_days=(10, 20, 30, 50), horizons_weights=(1, 1, 1, 1))
 
-    # multi-horizon
     preset = st.selectbox(
         f"{prefix} Preset horizons",
         ["21/63/126 (1/3/6 mois approx.)", "20/60/120", "Custom"],
@@ -803,7 +819,6 @@ if not run_btn:
     st.stop()
 
 try:
-    # Common tickers needed (include CASH + benchmark)
     core = _normalize_ticker_list(core_tickers_raw)
     sat = _normalize_ticker_list(sat_tickers_raw)
     if not core and not sat:
@@ -814,7 +829,6 @@ try:
     prices_raw = get_prices_for_run(all_needed)
     prices = align_and_clean_prices(prices_raw, all_needed)
 
-    # MAIN LAYOUT
     if not compare_mode:
         c_left, c_right = st.columns([1.2, 1.0], vertical_alignment="top")
 
@@ -824,10 +838,6 @@ try:
             core_weight = st.slider("Poids Core", min_value=0.0, max_value=1.0, value=0.60, step=0.05, key="s1_core_w")
             top_k = st.number_input("Top K satellites", min_value=1, max_value=50, value=3, step=1, key="s1_topk")
             cfg = build_strategy_cfg("Stratégie", mom, core_weight, int(top_k))
-
-            # If single-horizon sweep requested via "lookback_days=0 and horizons=(10,20,30,50)" but user selected Sweep in single-horizon mode,
-            # we treat as sweep only when horizons are exactly (10,20,30,50) and weights (1,1,1,1) AND multi-horizon is OFF:
-            # Here, we use sweep only when mom.horizons_days == (10,20,30,50) and mom.mode is set, and user didn't turn on multi-horizon.
             do_sweep = (mom.horizons_days == (10, 20, 30, 50)) and (mom.horizons_weights == (1, 1, 1, 1)) and (mom.lookback_days == 0)
 
         with c_right:
@@ -857,7 +867,6 @@ try:
                 fee_bps=cfg.fee_bps,
             )
 
-        # RUN (single or sweep)
         if do_sweep:
             st.subheader("Résultats Sweep (lookback jours: 10/20/30/50)")
             rows = []
@@ -911,7 +920,6 @@ try:
             st.download_button("⬇️ equity_curve.csv", equity.to_csv().encode("utf-8"), file_name="equity_curve.csv")
             st.download_button("⬇️ weights_rebalance.csv", weights.to_csv().encode("utf-8"), file_name="weights_rebalance.csv")
 
-            # PDF
             eq_png = _fig_to_png_bytes(plot_equity_multi({f"Lookback {pick}": equity}, logy=logy))
             dd_png = _fig_to_png_bytes(plot_drawdown(equity["portfolio"]))
             pdf = build_pdf_report(
@@ -970,7 +978,6 @@ try:
             st.download_button("⬇️ equity_curve.csv", equity.to_csv().encode("utf-8"), file_name="equity_curve.csv")
             st.download_button("⬇️ weights_rebalance.csv", weights.to_csv().encode("utf-8"), file_name="weights_rebalance.csv")
 
-            # PDF
             eq_png = _fig_to_png_bytes(plot_equity_multi({cfg.name: equity}, logy=logy))
             dd_png = _fig_to_png_bytes(plot_drawdown(equity["portfolio"]))
             pdf = build_pdf_report(
@@ -1013,7 +1020,6 @@ try:
         fig = plot_equity_multi(equities, logy=logy)
         st.pyplot(fig)
 
-        # stats table
         rows = []
         for name, eq in equities.items():
             stt = perf_stats(eq["portfolio"])
@@ -1024,13 +1030,11 @@ try:
         pick = st.selectbox("Afficher les poids (rebalance) pour", options=list(equities.keys()), index=0)
         st.dataframe(weights_last[pick].tail(12).style.format("{:.2%}"), use_container_width=True)
 
-        # Downloads (combined)
         st.markdown("### Téléchargements")
         combined = pd.DataFrame({name: eq["portfolio"] for name, eq in equities.items()})
         combined["benchmark"] = next(iter(equities.values()))["benchmark"]
         st.download_button("⬇️ equity_compare.csv", combined.to_csv().encode("utf-8"), file_name="equity_compare.csv")
 
-        # PDF report for comparison (single chart + stats lines)
         eq_png = _fig_to_png_bytes(plot_equity_multi(equities, logy=logy))
         stats_rows = [{"Strategy": name, **format_stats_dict(perf_stats(eq["portfolio"]))} for name, eq in equities.items()]
         pdf = build_pdf_report(title="Rapport - Comparaison", stats_rows=stats_rows, equity_png=eq_png, dd_png=None)
