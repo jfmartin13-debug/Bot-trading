@@ -3,7 +3,8 @@
 # + PDF export, multi-strategy comparison, multi-horizon momentum, weekly/quarterly rebal, hashed passwords,
 # + core_weight optimization grid-search.
 #
-# Data source: Yahoo Finance (yfinance) by default with cache (ROBUST: bulk download + per-ticker fallback)
+# Data source: Yahoo Finance (yfinance) by default with cache
+#   ✅ ROBUST yfinance loader: handles MultiIndex orientation + per-ticker fallback
 # CSV option preserved: wide CSV + multi CSV upload
 # Auth: APP_PASSWORD (fallback plaintext) + option USERS multi-user (plaintext or PBKDF2-hash), compare_digest on bytes
 #
@@ -112,7 +113,6 @@ def pbkdf2_verify(password: str, stored: str) -> bool:
 
 
 def _check_password(input_pw: str, stored_pw_or_hash: str) -> bool:
-    # If looks like PBKDF2 format, verify hash; else fallback to plaintext compare
     if stored_pw_or_hash.startswith("pbkdf2$"):
         return pbkdf2_verify(input_pw, stored_pw_or_hash)
     return _secure_compare(input_pw, stored_pw_or_hash)
@@ -123,7 +123,6 @@ def require_login() -> None:
     app_password = _get_secret("APP_PASSWORD", "")
     app_password_hash = _get_secret("APP_PASSWORD_HASH", "")
 
-    # If neither is set, allow access but warn (so app still runs).
     if not users and not app_password and not app_password_hash:
         st.warning("⚠️ Auth non configurée (USERS / APP_PASSWORD / APP_PASSWORD_HASH). Accès libre.")
         st.session_state["auth_ok"] = True
@@ -146,7 +145,6 @@ def require_login() -> None:
                 st.sidebar.error("Identifiants invalides.")
         st.stop()
 
-    # single-user
     password = st.sidebar.text_input("Mot de passe", type="password", key="auth_pass_single")
     if st.sidebar.button("Se connecter", use_container_width=True):
         if app_password_hash:
@@ -179,7 +177,11 @@ def _normalize_ticker_list(raw: str) -> List[str]:
 def load_prices_yahoo(tickers: Tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """
     Returns adjusted close prices for tickers (business days).
-    Robust: tries yf.download first, then falls back to per-ticker history.
+
+    Robust:
+      - Forces group_by="ticker"
+      - Handles MultiIndex columns orientation (ticker, field) or (field, ticker)
+      - Falls back to per-ticker Ticker().history()
     Includes synthetic CASH (flat 1.0).
     """
     tickers_list = [str(t).strip().upper() for t in tickers if str(t).strip()]
@@ -197,9 +199,50 @@ def load_prices_yahoo(tickers: Tuple[str, ...], start: str, end: str) -> pd.Data
         prices = prices.ffill().dropna(how="all")
         return prices
 
+    def _extract_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+
+        # Single ticker OHLCV (no MultiIndex)
+        if not isinstance(df.columns, pd.MultiIndex):
+            col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+            if col is None:
+                return pd.DataFrame()
+            name = yf_tickers[0] if len(yf_tickers) == 1 else col
+            return df[col].to_frame(name=str(name).upper())
+
+        lvl0 = set(map(str, df.columns.get_level_values(0)))
+        lvl1 = set(map(str, df.columns.get_level_values(1)))
+
+        # Case A: (field, ticker)
+        if "Adj Close" in lvl0:
+            out = df["Adj Close"].copy()
+            if isinstance(out, pd.Series):
+                out = out.to_frame()
+            return out
+        if "Close" in lvl0:
+            out = df["Close"].copy()
+            if isinstance(out, pd.Series):
+                out = out.to_frame()
+            return out
+
+        # Case B: (ticker, field)
+        if "Adj Close" in lvl1:
+            out = df.xs("Adj Close", level=1, axis=1).copy()
+            if isinstance(out, pd.Series):
+                out = out.to_frame()
+            return out
+        if "Close" in lvl1:
+            out = df.xs("Close", level=1, axis=1).copy()
+            if isinstance(out, pd.Series):
+                out = out.to_frame()
+            return out
+
+        return pd.DataFrame()
+
     prices = pd.DataFrame()
 
-    # 1) Bulk download (fast)
+    # 1) Bulk download
     if yf_tickers:
         try:
             df = yf.download(
@@ -209,26 +252,14 @@ def load_prices_yahoo(tickers: Tuple[str, ...], start: str, end: str) -> pd.Data
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
-                group_by="column",
+                group_by="ticker",  # ✅ important
                 threads=True,
             )
-
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    # group_by="column" => first level usually fields, second tickers
-                    if "Adj Close" in df.columns.get_level_values(0):
-                        prices = df["Adj Close"].copy()
-                    elif "Close" in df.columns.get_level_values(0):
-                        prices = df["Close"].copy()
-                else:
-                    # single ticker -> OHLCV columns
-                    col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
-                    if col:
-                        prices = df[col].to_frame(name=yf_tickers[0])
+            prices = _extract_price_frame(df)
         except Exception:
             prices = pd.DataFrame()
 
-    # 2) Fallback: per-ticker history (more robust)
+    # 2) Fallback: per-ticker history
     if prices.empty and yf_tickers:
         frames = []
         for t in yf_tickers:
@@ -246,12 +277,11 @@ def load_prices_yahoo(tickers: Tuple[str, ...], start: str, end: str) -> pd.Data
 
     prices = _finalize(prices)
 
-    # If still empty, fail with clear message (instead of “tickers manquants”)
-    if prices.empty:
+    if prices.empty or prices.shape[1] == 0:
         raise RuntimeError(
-            "yfinance a renvoyé 0 données (réponse vide). "
-            "Ca arrive parfois sur Streamlit Cloud (rate-limit / réseau). "
-            "Reboot l'app et réessaie, ou utilise la source CSV."
+            "yfinance a renvoyé 0 données utilisables (aucune colonne prix). "
+            "Sur Streamlit Cloud ça peut arriver (rate-limit / réseau). "
+            "Essaie: Reboot app, ou réduis la période, ou passe en CSV."
         )
 
     return prices
@@ -335,8 +365,8 @@ def align_and_clean_prices(prices: pd.DataFrame, tickers_needed: List[str]) -> p
 class MomentumConfig:
     mode: str = "DUAL"  # DUAL or SINGLE
     lookback_days: int = 126
-    horizons_days: Tuple[int, ...] = ()  # if non-empty => multi-horizon
-    horizons_weights: Tuple[float, ...] = ()  # same length as horizons_days
+    horizons_days: Tuple[int, ...] = ()
+    horizons_weights: Tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -344,19 +374,18 @@ class StrategyConfig:
     name: str
     core_tickers: Tuple[str, ...]
     satellite_tickers: Tuple[str, ...]
-    benchmark_ticker: str                 # crash filter + chart + dual ref
+    benchmark_ticker: str
     risk_off_ticker: str = CASH_SYMBOL
-    core_weight: float = 0.60             # rest => satellite sleeve
+    core_weight: float = 0.60
     top_k: int = 3
     momentum: MomentumConfig = MomentumConfig()
-    crash_ma_days: int = 200              # 0 => off
-    rebalance: str = "M"                  # W, M, Q
-    fee_bps: float = 0.0                  # per rebalance, turnover-based
+    crash_ma_days: int = 200
+    rebalance: str = "M"
+    fee_bps: float = 0.0
 
 
 def _returns_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    rets = prices.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return rets
+    return prices.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 def _rebalance_dates(idx: pd.DatetimeIndex, mode: str) -> pd.DatetimeIndex:
@@ -364,24 +393,17 @@ def _rebalance_dates(idx: pd.DatetimeIndex, mode: str) -> pd.DatetimeIndex:
     mode_u = (mode or "M").upper().strip()
 
     if mode_u.startswith("W"):
-        r = s.resample("W-FRI").last().dropna().index
-        return pd.DatetimeIndex(r)
-
+        return pd.DatetimeIndex(s.resample("W-FRI").last().dropna().index)
     if mode_u.startswith("Q"):
-        r = s.resample("Q").last().dropna().index
-        return pd.DatetimeIndex(r)
-
-    r = s.resample("M").last().dropna().index
-    return pd.DatetimeIndex(r)
+        return pd.DatetimeIndex(s.resample("Q").last().dropna().index)
+    return pd.DatetimeIndex(s.resample("M").last().dropna().index)
 
 
 def _asof_index(prices: pd.DataFrame, asof: pd.Timestamp) -> int:
     if asof in prices.index:
         return int(prices.index.get_loc(asof))
     pos = prices.index.get_indexer([asof], method="ffill")[0]
-    if pos < 0:
-        return 0
-    return int(pos)
+    return 0 if pos < 0 else int(pos)
 
 
 def _momentum_total_return(prices: pd.DataFrame, asof: pd.Timestamp, lookback_days: int, tickers: Sequence[str]) -> pd.Series:
@@ -725,18 +747,17 @@ with st.sidebar:
 def get_prices_for_run(all_needed: List[str]) -> pd.DataFrame:
     if source == "Yahoo Finance (yfinance)":
         return load_prices_yahoo(tuple(all_needed), start=start, end=end)
-    elif source == "CSV (wide)":
+    if source == "CSV (wide)":
         f = st.sidebar.file_uploader("Upload CSV wide", type=["csv"], accept_multiple_files=False)
         if f is None:
             st.info("Upload un CSV wide pour continuer.")
             st.stop()
         return load_prices_from_wide_csv(f)
-    else:
-        fs = st.sidebar.file_uploader("Upload plusieurs CSV", type=["csv"], accept_multiple_files=True)
-        if not fs:
-            st.info("Upload plusieurs CSV pour continuer.")
-            st.stop()
-        return load_prices_from_multi_csv(fs)
+    fs = st.sidebar.file_uploader("Upload plusieurs CSV", type=["csv"], accept_multiple_files=True)
+    if not fs:
+        st.info("Upload plusieurs CSV pour continuer.")
+        st.stop()
+    return load_prices_from_multi_csv(fs)
 
 
 def build_momentum_ui(prefix: str) -> MomentumConfig:
@@ -749,7 +770,6 @@ def build_momentum_ui(prefix: str) -> MomentumConfig:
         if lookback_mode == "Custom":
             lb = st.number_input(f"{prefix} Lookback (jours)", min_value=5, max_value=2000, value=126, step=5, key=f"{prefix}_lb")
             return MomentumConfig(mode=mode, lookback_days=int(lb), horizons_days=(), horizons_weights=())
-        # sweep marker
         return MomentumConfig(mode=mode, lookback_days=0, horizons_days=(10, 20, 30, 50), horizons_weights=(1, 1, 1, 1))
 
     preset = st.selectbox(
